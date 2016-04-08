@@ -1,0 +1,3213 @@
+#!/usr/bin/python -tt
+# -*- coding: utf-8 -*-
+
+# (c) 2012, Red Hat, Inc
+# Written by Seth Vidal <skvidal at fedoraproject.org>
+# (c) 2014, Epic Games, Inc.
+#
+# This file is part of Ansible
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+
+import traceback
+import os
+import yum
+import rpm
+import syslog
+import platform
+import tempfile
+import shutil
+from distutils.version import LooseVersion
+
+try:
+    from yum.misc import find_unfinished_transactions, find_ts_remaining
+    from rpmUtils.miscutils import splitFilename
+    transaction_helpers = True
+except:
+    transaction_helpers = False
+
+DOCUMENTATION = '''
+---
+module: yum
+version_added: historical
+short_description: Manages packages with the I(yum) package manager
+description:
+     - Installs, upgrade, removes, and lists packages and groups with the I(yum) package manager.
+options:
+  name:
+    description:
+      - "Package name, or package specifier with version, like C(name-1.0). When using state=latest, this can be '*' which means run: yum -y update. You can also pass a url or a local path to a rpm file."
+    required: true
+    default: null
+    aliases: []
+  list:
+    description:
+      - Various (non-idempotent) commands for usage with C(/usr/bin/ansible) and I(not) playbooks. See examples.
+    required: false
+    default: null
+  state:
+    description:
+      - Whether to install (C(present), C(latest)), or remove (C(absent)) a package.
+    required: false
+    choices: [ "present", "latest", "absent" ]
+    default: "present"
+  enablerepo:
+    description:
+      - I(Repoid) of repositories to enable for the install/update operation.
+        These repos will not persist beyond the transaction.
+        When specifying multiple repos, separate them with a ",".
+    required: false
+    version_added: "0.9"
+    default: null
+    aliases: []
+    
+  disablerepo:
+    description:
+      - I(Repoid) of repositories to disable for the install/update operation.
+        These repos will not persist beyond the transaction.
+        When specifying multiple repos, separate them with a ",".
+    required: false
+    version_added: "0.9"
+    default: null
+    aliases: []
+
+  conf_file:
+    description:
+      - The remote yum configuration file to use for the transaction.
+    required: false
+    version_added: "0.6"
+    default: null
+    aliases: []
+
+  disable_gpg_check:
+    description:
+      - Whether to disable the GPG checking of signatures of packages being
+        installed. Has an effect only if state is I(present) or I(latest).
+    required: false
+    version_added: "1.2"
+    default: "no"
+    choices: ["yes", "no"]
+    aliases: []
+
+  update_cache:
+    description:
+      - Force updating the cache. Has an effect only if state is I(present)
+        or I(latest).
+    required: false
+    version_added: "1.9"
+    default: "no"
+    choices: ["yes", "no"]
+    aliases: []
+
+notes: []
+# informational: requirements for nodes
+requirements: [ yum ]
+author: Seth Vidal
+'''
+
+EXAMPLES = '''
+- name: install the latest version of Apache
+  yum: name=httpd state=latest
+
+- name: remove the Apache package
+  yum: name=httpd state=absent
+
+- name: install the latest version of Apache from the testing repo
+  yum: name=httpd enablerepo=testing state=present
+
+- name: install one specific version of Apache
+  yum: name=httpd-2.2.29-1.4.amzn1 state=present
+
+- name: upgrade all packages
+  yum: name=* state=latest
+
+- name: install the nginx rpm from a remote repo
+  yum: name=http://nginx.org/packages/centos/6/noarch/RPMS/nginx-release-centos-6-0.el6.ngx.noarch.rpm state=present
+
+- name: install nginx rpm from a local file
+  yum: name=/usr/local/src/nginx-release-centos-6-0.el6.ngx.noarch.rpm state=present
+
+- name: install the 'Development tools' package group
+  yum: name="@Development tools" state=present
+'''
+
+def_qf = "%{name}-%{version}-%{release}.%{arch}"
+
+repoquery='/usr/bin/repoquery'
+if not os.path.exists(repoquery):
+    repoquery = None
+
+yumbin='/usr/bin/yum'
+
+def log(msg):
+    syslog.openlog('ansible-yum', 0, syslog.LOG_USER)
+    syslog.syslog(syslog.LOG_NOTICE, msg)
+
+def yum_base(conf_file=None):
+
+    my = yum.YumBase()
+    my.preconf.debuglevel=0
+    my.preconf.errorlevel=0
+    if conf_file and os.path.exists(conf_file):
+        my.preconf.fn = conf_file
+    if os.geteuid() != 0:
+        if hasattr(my, 'setCacheDir'):
+            my.setCacheDir()
+        else:
+            cachedir = yum.misc.getCacheDir()
+            my.repos.setCacheDir(cachedir)
+            my.conf.cache = 0
+
+    return my
+
+def install_yum_utils(module):
+
+    if not module.check_mode:    
+        yum_path = module.get_bin_path('yum')
+        if yum_path:
+            rc, so, se = module.run_command('%s -y install yum-utils' % yum_path) 
+            if rc == 0:
+                this_path = module.get_bin_path('repoquery')
+                global repoquery
+                repoquery = this_path
+
+def po_to_nevra(po):
+
+    if hasattr(po, 'ui_nevra'):
+        return po.ui_nevra
+    else:
+        return '%s-%s-%s.%s' % (po.name, po.version, po.release, po.arch)
+
+def is_installed(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, dis_repos=None, is_pkg=False):
+    if en_repos is None:
+        en_repos = []
+    if dis_repos is None:
+        dis_repos = []
+    if not repoq:
+
+        pkgs = []
+        try:
+            my = yum_base(conf_file)
+            for rid in en_repos:
+                my.repos.enableRepo(rid)
+            for rid in dis_repos:
+                my.repos.disableRepo(rid)
+                
+            e,m,u = my.rpmdb.matchPackageNames([pkgspec])
+            pkgs = e + m
+            if not pkgs:
+                pkgs.extend(my.returnInstalledPackagesByDep(pkgspec))
+        except Exception, e:
+            module.fail_json(msg="Failure talking to yum: %s" % e)
+
+        return [ po_to_nevra(p) for p in pkgs ]
+
+    else:
+
+        cmd = repoq + ["--disablerepo=*", "--pkgnarrow=installed", "--qf", qf, pkgspec]
+        rc,out,err = module.run_command(cmd)
+        if not is_pkg:
+            cmd = repoq + ["--disablerepo=*", "--pkgnarrow=installed", "--qf", qf, "--whatprovides", pkgspec]
+            rc2,out2,err2 = module.run_command(cmd)
+        else:
+            rc2,out2,err2 = (0, '', '')
+            
+        if rc == 0 and rc2 == 0:
+            out += out2
+            return [ p for p in out.split('\n') if p.strip() ]
+        else:
+            module.fail_json(msg='Error from repoquery: %s: %s' % (cmd, err + err2))
+            
+    return []
+
+def is_available(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, dis_repos=None):
+    if en_repos is None:
+        en_repos = []
+    if dis_repos is None:
+        dis_repos = []
+
+    if not repoq:
+
+        pkgs = []
+        try:
+            my = yum_base(conf_file)
+            for rid in en_repos:
+                my.repos.enableRepo(rid)
+            for rid in dis_repos:
+                my.repos.disableRepo(rid)
+
+            e,m,u = my.pkgSack.matchPackageNames([pkgspec])
+            pkgs = e + m
+            if not pkgs:
+                pkgs.extend(my.returnPackagesByDep(pkgspec))
+        except Exception, e:
+            module.fail_json(msg="Failure talking to yum: %s" % e)
+            
+        return [ po_to_nevra(p) for p in pkgs ]
+
+    else:
+        myrepoq = list(repoq)
+                 
+        r_cmd = ['--disablerepo', ','.join(dis_repos)]
+        myrepoq.extend(r_cmd)
+
+        r_cmd = ['--enablerepo', ','.join(en_repos)]
+        myrepoq.extend(r_cmd)
+
+        cmd = myrepoq + ["--qf", qf, pkgspec]
+        rc,out,err = module.run_command(cmd)
+        if rc == 0:
+            return [ p for p in out.split('\n') if p.strip() ]
+        else:
+            module.fail_json(msg='Error from repoquery: %s: %s' % (cmd, err))
+
+    return []
+
+def is_update(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, dis_repos=None):
+    if en_repos is None:
+        en_repos = []
+    if dis_repos is None:
+        dis_repos = []
+
+    if not repoq:
+
+        retpkgs = []
+        pkgs = []
+        updates = []
+
+        try:
+            my = yum_base(conf_file)
+            for rid in en_repos:
+                my.repos.enableRepo(rid)
+            for rid in dis_repos:
+                my.repos.disableRepo(rid)
+
+            pkgs = my.returnPackagesByDep(pkgspec) + my.returnInstalledPackagesByDep(pkgspec)
+            if not pkgs:
+                e,m,u = my.pkgSack.matchPackageNames([pkgspec])
+                pkgs = e + m
+            updates = my.doPackageLists(pkgnarrow='updates').updates 
+        except Exception, e:
+            module.fail_json(msg="Failure talking to yum: %s" % e)
+
+        for pkg in pkgs:
+            if pkg in updates:
+                retpkgs.append(pkg)
+            
+        return set([ po_to_nevra(p) for p in retpkgs ])
+
+    else:
+        myrepoq = list(repoq)
+        r_cmd = ['--disablerepo', ','.join(dis_repos)]
+        myrepoq.extend(r_cmd)
+
+        r_cmd = ['--enablerepo', ','.join(en_repos)]
+        myrepoq.extend(r_cmd)
+
+        cmd = myrepoq + ["--pkgnarrow=updates", "--qf", qf, pkgspec]
+        rc,out,err = module.run_command(cmd)
+        
+        if rc == 0:
+            return set([ p for p in out.split('\n') if p.strip() ])
+        else:
+            module.fail_json(msg='Error from repoquery: %s: %s' % (cmd, err))
+            
+    return []
+
+def what_provides(module, repoq, req_spec, conf_file,  qf=def_qf, en_repos=None, dis_repos=None):
+    if en_repos is None:
+        en_repos = []
+    if dis_repos is None:
+        dis_repos = []
+
+    if not repoq:
+
+        pkgs = []
+        try:
+            my = yum_base(conf_file)
+            for rid in en_repos:
+                my.repos.enableRepo(rid)
+            for rid in dis_repos:
+                my.repos.disableRepo(rid)
+
+            pkgs = my.returnPackagesByDep(req_spec) + my.returnInstalledPackagesByDep(req_spec)
+            if not pkgs:
+                e,m,u = my.pkgSack.matchPackageNames([req_spec])
+                pkgs.extend(e)
+                pkgs.extend(m)
+                e,m,u = my.rpmdb.matchPackageNames([req_spec])
+                pkgs.extend(e)
+                pkgs.extend(m)
+        except Exception, e:
+            module.fail_json(msg="Failure talking to yum: %s" % e)
+
+        return set([ po_to_nevra(p) for p in pkgs ])
+
+    else:
+        myrepoq = list(repoq)
+        r_cmd = ['--disablerepo', ','.join(dis_repos)]
+        myrepoq.extend(r_cmd)
+
+        r_cmd = ['--enablerepo', ','.join(en_repos)]
+        myrepoq.extend(r_cmd)
+
+        cmd = myrepoq + ["--qf", qf, "--whatprovides", req_spec]
+        rc,out,err = module.run_command(cmd)
+        cmd = myrepoq + ["--qf", qf, req_spec]
+        rc2,out2,err2 = module.run_command(cmd)
+        if rc == 0 and rc2 == 0:
+            out += out2
+            pkgs = set([ p for p in out.split('\n') if p.strip() ])
+            if not pkgs:
+                pkgs = is_installed(module, repoq, req_spec, conf_file, qf=qf)
+            return pkgs
+        else:
+            module.fail_json(msg='Error from repoquery: %s: %s' % (cmd, err + err2))
+
+    return []
+
+def transaction_exists(pkglist):
+    """ 
+    checks the package list to see if any packages are 
+    involved in an incomplete transaction 
+    """
+
+    conflicts = []
+    if not transaction_helpers:
+        return conflicts
+
+    # first, we create a list of the package 'nvreas'
+    # so we can compare the pieces later more easily
+    pkglist_nvreas = []
+    for pkg in pkglist:
+        pkglist_nvreas.append(splitFilename(pkg))
+
+    # next, we build the list of packages that are
+    # contained within an unfinished transaction
+    unfinished_transactions = find_unfinished_transactions()
+    for trans in unfinished_transactions:
+        steps = find_ts_remaining(trans)
+        for step in steps:
+            # the action is install/erase/etc., but we only
+            # care about the package spec contained in the step
+            (action, step_spec) = step
+            (n,v,r,e,a) = splitFilename(step_spec)
+            # and see if that spec is in the list of packages
+            # requested for installation/updating
+            for pkg in pkglist_nvreas:
+                # if the name and arch match, we're going to assume
+                # this package is part of a pending transaction
+                # the label is just for display purposes
+                label = "%s-%s" % (n,a)
+                if n == pkg[0] and a == pkg[4]:
+                    if label not in conflicts:
+                        conflicts.append("%s-%s" % (n,a))
+                    break
+    return conflicts
+
+def local_nvra(module, path):
+    """return nvra of a local rpm passed in"""
+
+    ts = rpm.TransactionSet()
+    ts.setVSFlags(rpm._RPMVSF_NOSIGNATURES)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        header = ts.hdrFromFdno(fd)
+    finally:
+        os.close(fd)
+
+    return '%s-%s-%s.%s' % (header[rpm.RPMTAG_NAME], 
+                            header[rpm.RPMTAG_VERSION],
+                            header[rpm.RPMTAG_RELEASE],
+                            header[rpm.RPMTAG_ARCH])
+    
+def pkg_to_dict(pkgstr):
+
+    if pkgstr.strip():
+        n,e,v,r,a,repo = pkgstr.split('|')
+    else:
+        return {'error_parsing': pkgstr}
+
+    d = {
+        'name':n,
+        'arch':a,
+        'epoch':e,
+        'release':r,
+        'version':v,
+        'repo':repo,
+        'nevra': '%s:%s-%s-%s.%s' % (e,n,v,r,a)
+    }
+
+    if repo == 'installed':
+        d['yumstate'] = 'installed'
+    else:
+        d['yumstate'] = 'available'
+
+    return d
+
+def repolist(module, repoq, qf="%{repoid}"):
+
+    cmd = repoq + ["--qf", qf, "-a"]
+    rc,out,err = module.run_command(cmd)
+    ret = []
+    if rc == 0:
+        ret = set([ p for p in out.split('\n') if p.strip() ])
+    return ret
+
+def list_stuff(module, conf_file, stuff):
+
+    qf = "%{name}|%{epoch}|%{version}|%{release}|%{arch}|%{repoid}"
+    repoq = [repoquery, '--show-duplicates', '--plugins', '--quiet', '-q']
+    if conf_file and os.path.exists(conf_file):
+        repoq += ['-c', conf_file]
+
+    if stuff == 'installed':
+        return [ pkg_to_dict(p) for p in is_installed(module, repoq, '-a', conf_file, qf=qf) if p.strip() ]
+    elif stuff == 'updates':
+        return [ pkg_to_dict(p) for p in is_update(module, repoq, '-a', conf_file, qf=qf) if p.strip() ]
+    elif stuff == 'available':
+        return [ pkg_to_dict(p) for p in is_available(module, repoq, '-a', conf_file, qf=qf) if p.strip() ]
+    elif stuff == 'repos':
+        return [ dict(repoid=name, state='enabled') for name in repolist(module, repoq) if name.strip() ]
+    else:
+        return [ pkg_to_dict(p) for p in is_installed(module, repoq, stuff, conf_file, qf=qf) + is_available(module, repoq, stuff, conf_file, qf=qf) if p.strip() ]
+
+def install(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos):
+
+    pkgs = []
+    res = {}
+    res['results'] = []
+    res['msg'] = ''
+    res['rc'] = 0
+    res['changed'] = False
+    tempdir = tempfile.mkdtemp()
+
+    for spec in items:
+        pkg = None
+
+        # check if pkgspec is installed (if possible for idempotence)
+        # localpkg
+        if spec.endswith('.rpm') and '://' not in spec:
+            # get the pkg name-v-r.arch
+            if not os.path.exists(spec):
+                res['msg'] += "No Package file matching '%s' found on system" % spec
+                module.fail_json(**res)
+
+            nvra = local_nvra(module, spec)
+            # look for them in the rpmdb
+            if is_installed(module, repoq, nvra, conf_file, en_repos=en_repos, dis_repos=dis_repos):
+                # if they are there, skip it
+                continue
+            pkg = spec
+
+        # URL
+        elif '://' in spec:
+            pkg = spec
+            # Check if Enterprise Linux 5 or less, as yum on those versions do not support installing via url
+            distribution_version = get_distribution_version()
+            distribution = platform.dist()
+            if distribution[0] == "redhat" and LooseVersion(distribution_version) < LooseVersion("6"):
+                package = os.path.join(tempdir, str(pkg.rsplit('/', 1)[1]))
+                try:
+                    rsp, info = fetch_url(module, pkg)
+                    data = rsp.read()
+                    f = open(package, 'w')
+                    f.write(data)
+                    f.close()
+                    pkg = package
+                except Exception, e:
+                    shutil.rmtree(tempdir)
+                    module.fail_json(msg="Failure downloading %s, %s" % (spec, e))
+
+        #groups :(
+        elif  spec.startswith('@'):
+            # complete wild ass guess b/c it's a group
+            pkg = spec
+
+        # range requires or file-requires or pkgname :(
+        else:
+            # most common case is the pkg is already installed and done
+            # short circuit all the bs - and search for it as a pkg in is_installed
+            # if you find it then we're done
+            if not set(['*','?']).intersection(set(spec)):
+                installed_pkgs = is_installed(module, repoq, spec, conf_file, en_repos=en_repos, dis_repos=dis_repos, is_pkg=True)
+                if installed_pkgs:
+                    res['results'].append('%s providing %s is already installed' % (installed_pkgs[0], spec))
+                    continue
+            
+            # look up what pkgs provide this
+            pkglist = what_provides(module, repoq, spec, conf_file, en_repos=en_repos, dis_repos=dis_repos)
+            if not pkglist:
+                res['msg'] += "No Package matching '%s' found available, installed or updated" % spec
+                module.fail_json(**res)
+
+            # if any of the packages are involved in a transaction, fail now
+            # so that we don't hang on the yum operation later
+            conflicts = transaction_exists(pkglist)
+            if len(conflicts) > 0:
+                res['msg'] += "The following packages have pending transactions: %s" % ", ".join(conflicts)
+                module.fail_json(**res)
+
+            # if any of them are installed
+            # then nothing to do
+
+            found = False
+            for this in pkglist:
+                if is_installed(module, repoq, this, conf_file, en_repos=en_repos, dis_repos=dis_repos, is_pkg=True):
+                    found = True
+                    res['results'].append('%s providing %s is already installed' % (this, spec))
+                    break
+
+            # if the version of the pkg you have installed is not in ANY repo, but there are
+            # other versions in the repos (both higher and lower) then the previous checks won't work.
+            # so we check one more time. This really only works for pkgname - not for file provides or virt provides
+            # but virt provides should be all caught in what_provides on its own.
+            # highly irritating
+            if not found:
+                if is_installed(module, repoq, spec, conf_file, en_repos=en_repos, dis_repos=dis_repos):
+                    found = True
+                    res['results'].append('package providing %s is already installed' % (spec))
+                    
+            if found:
+                continue
+
+            # if not - then pass in the spec as what to install
+            # we could get here if nothing provides it but that's not
+            # the error we're catching here
+            pkg = spec
+
+        pkgs.append(pkg)
+
+    if pkgs:
+        cmd = yum_basecmd + ['install'] + pkgs
+
+        if module.check_mode:
+            # Remove rpms downloaded for EL5 via url
+            try:
+                shutil.rmtree(tempdir)
+            except Exception, e:
+                module.fail_json(msg="Failure deleting temp directory %s, %s" % (tempdir, e))
+            module.exit_json(changed=True)
+
+        changed = True
+
+        rc, out, err = module.run_command(cmd)
+
+        if (rc == 1):
+            for spec in items:
+                # Fail on invalid urls:
+                if ('://' in spec and ('No package %s available.' % spec in out or 'Cannot open: %s. Skipping.' % spec in err)):
+                    err = 'Package at %s could not be installed' % spec
+                    module.fail_json(changed=False,msg=err,rc=1)
+        if (rc != 0 and 'Nothing to do' in err) or 'Nothing to do' in out:
+            # avoid failing in the 'Nothing To Do' case
+            # this may happen with an URL spec.
+            # for an already installed group,
+            # we get rc = 0 and 'Nothing to do' in out, not in err.
+            rc = 0
+            err = ''
+            out = '%s: Nothing to do' % spec
+            changed = False
+
+        res['rc'] = rc
+        res['results'].append(out)
+        res['msg'] += err
+
+        # FIXME - if we did an install - go and check the rpmdb to see if it actually installed
+        # look for each pkg in rpmdb
+        # look for each pkg via obsoletes
+
+        # Record change
+        res['changed'] = changed
+
+    # Remove rpms downloaded for EL5 via url
+    try:
+        shutil.rmtree(tempdir)
+    except Exception, e:
+        module.fail_json(msg="Failure deleting temp directory %s, %s" % (tempdir, e))
+  
+    module.exit_json(**res)
+
+
+def remove(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos):
+
+    pkgs = []
+    res = {}
+    res['results'] = []
+    res['msg'] = ''
+    res['changed'] = False
+    res['rc'] = 0
+
+    for pkg in items:
+        is_group = False
+        # group remove - this is doom on a stick
+        if pkg.startswith('@'):
+            is_group = True
+        else:
+            if not is_installed(module, repoq, pkg, conf_file, en_repos=en_repos, dis_repos=dis_repos):
+                res['results'].append('%s is not installed' % pkg)
+                continue
+
+        pkgs.append(pkg)
+
+    if pkgs:
+        # run an actual yum transaction
+        cmd = yum_basecmd + ["remove"] + pkgs
+
+        if module.check_mode:
+            module.exit_json(changed=True)
+
+        rc, out, err = module.run_command(cmd)
+
+        res['rc'] = rc
+        res['results'].append(out)
+        res['msg'] = err
+
+        # compile the results into one batch. If anything is changed 
+        # then mark changed
+        # at the end - if we've end up failed then fail out of the rest
+        # of the process
+
+        # at this point we should check to see if the pkg is no longer present
+        
+        for pkg in pkgs:
+            if not pkg.startswith('@'): # we can't sensibly check for a group being uninstalled reliably
+                # look to see if the pkg shows up from is_installed. If it doesn't
+                if not is_installed(module, repoq, pkg, conf_file, en_repos=en_repos, dis_repos=dis_repos):
+                    res['changed'] = True
+                else:
+                    module.fail_json(**res)
+
+        if rc != 0:
+            module.fail_json(**res)
+            
+    module.exit_json(**res)
+
+def latest(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos):
+
+    res = {}
+    res['results'] = []
+    res['msg'] = ''
+    res['changed'] = False
+    res['rc'] = 0
+
+    for spec in items:
+
+        pkg = None
+        basecmd = 'update'
+        cmd = ''
+        # groups, again
+        if spec.startswith('@'):
+            pkg = spec
+        
+        elif spec == '*': #update all
+            # use check-update to see if there is any need
+            rc,out,err = module.run_command(yum_basecmd + ['check-update'])
+            if rc == 100:
+                cmd = yum_basecmd + [basecmd]
+            else:
+                res['results'].append('All packages up to date')
+                continue
+        
+        # dep/pkgname  - find it
+        else:
+            if is_installed(module, repoq, spec, conf_file, en_repos=en_repos, dis_repos=dis_repos):
+                basecmd = 'update'
+            else:
+                basecmd = 'install'
+
+            pkglist = what_provides(module, repoq, spec, conf_file, en_repos=en_repos, dis_repos=dis_repos)
+            if not pkglist:
+                res['msg'] += "No Package matching '%s' found available, installed or updated" % spec
+                module.fail_json(**res)
+            
+            nothing_to_do = True
+            for this in pkglist:
+                if basecmd == 'install' and is_available(module, repoq, this, conf_file, en_repos=en_repos, dis_repos=dis_repos):
+                    nothing_to_do = False
+                    break
+                    
+                if basecmd == 'update' and is_update(module, repoq, this, conf_file, en_repos=en_repos, dis_repos=dis_repos):
+                    nothing_to_do = False
+                    break
+                    
+            if nothing_to_do:
+                res['results'].append("All packages providing %s are up to date" % spec)
+                continue
+
+            # if any of the packages are involved in a transaction, fail now
+            # so that we don't hang on the yum operation later
+            conflicts = transaction_exists(pkglist)
+            if len(conflicts) > 0:
+                res['msg'] += "The following packages have pending transactions: %s" % ", ".join(conflicts)
+                module.fail_json(**res)
+
+            pkg = spec
+        if not cmd:
+            cmd = yum_basecmd + [basecmd, pkg]
+
+        if module.check_mode:
+            return module.exit_json(changed=True)
+
+        rc, out, err = module.run_command(cmd)
+
+        res['rc'] += rc
+        res['results'].append(out)
+        res['msg'] += err
+
+        # FIXME if it is - update it and check to see if it applied
+        # check to see if there is no longer an update available for the pkgspec
+
+        if rc:
+            res['failed'] = True
+        else:
+            res['changed'] = True
+
+    module.exit_json(**res)
+
+def ensure(module, state, pkgspec, conf_file, enablerepo, disablerepo,
+           disable_gpg_check):
+
+    # take multiple args comma separated
+    items = pkgspec.split(',')
+
+    # need debug level 2 to get 'Nothing to do' for groupinstall.
+    yum_basecmd = [yumbin, '-d', '2', '-y']
+
+        
+    if not repoquery:
+        repoq = None
+    else:
+        repoq = [repoquery, '--show-duplicates', '--plugins', '--quiet', '-q']
+
+    if conf_file and os.path.exists(conf_file):
+        yum_basecmd += ['-c', conf_file]
+        if repoq:
+            repoq += ['-c', conf_file]
+
+    dis_repos =[]
+    en_repos = []
+    if disablerepo:
+        dis_repos = disablerepo.split(',')
+        r_cmd = ['--disablerepo=%s' % disablerepo]
+        yum_basecmd.extend(r_cmd)
+    if enablerepo:
+        en_repos = enablerepo.split(',')
+        r_cmd = ['--enablerepo=%s' % enablerepo]
+        yum_basecmd.extend(r_cmd)
+           
+
+
+    if state in ['installed', 'present', 'latest']:
+
+        if module.params.get('update_cache'):
+            module.run_command(yum_basecmd + ['makecache'])
+
+        my = yum_base(conf_file)
+        try:
+            if disablerepo:
+                my.repos.disableRepo(disablerepo)
+            current_repos = my.repos.repos.keys()
+            if enablerepo:
+                try:
+                    my.repos.enableRepo(enablerepo)
+                    new_repos = my.repos.repos.keys()
+                    for i in new_repos:
+                        if not i in current_repos:
+                            rid = my.repos.getRepo(i)
+                            a = rid.repoXML.repoid
+                    current_repos = new_repos
+                except yum.Errors.YumBaseError, e:
+                    module.fail_json(msg="Error setting/accessing repos: %s" % (e))
+        except yum.Errors.YumBaseError, e:
+            module.fail_json(msg="Error accessing repos: %s" % e)
+    if state in ['installed', 'present']:
+        if disable_gpg_check:
+            yum_basecmd.append('--nogpgcheck')
+        install(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos)
+    elif state in ['removed', 'absent']:
+        remove(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos)
+    elif state == 'latest':
+        if disable_gpg_check:
+            yum_basecmd.append('--nogpgcheck')
+        latest(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos)
+
+    # should be caught by AnsibleModule argument_spec
+    return dict(changed=False, failed=True, results='', errors='unexpected state')
+
+def main():
+
+    # state=installed name=pkgspec
+    # state=removed name=pkgspec
+    # state=latest name=pkgspec
+    #
+    # informational commands:
+    #   list=installed
+    #   list=updates
+    #   list=available
+    #   list=repos
+    #   list=pkgspec
+
+    module = AnsibleModule(
+        argument_spec = dict(
+            name=dict(aliases=['pkg']),
+            # removed==absent, installed==present, these are accepted as aliases
+            state=dict(default='installed', choices=['absent','present','installed','removed','latest']),
+            enablerepo=dict(),
+            disablerepo=dict(),
+            list=dict(),
+            conf_file=dict(default=None),
+            disable_gpg_check=dict(required=False, default="no", type='bool'),
+            update_cache=dict(required=False, default="no", type='bool'),
+            # this should not be needed, but exists as a failsafe
+            install_repoquery=dict(required=False, default="yes", type='bool'),
+        ),
+        required_one_of = [['name','list']],
+        mutually_exclusive = [['name','list']],
+        supports_check_mode = True
+    )
+
+    # this should not be needed, but exists as a failsafe
+    params = module.params
+    if params['install_repoquery'] and not repoquery and not module.check_mode:
+        install_yum_utils(module)
+
+    if params['list']:
+        if not repoquery:
+            module.fail_json(msg="repoquery is required to use list= with this module. Please install the yum-utils package.")
+        results = dict(results=list_stuff(module, params['conf_file'], params['list']))
+        module.exit_json(**results)
+
+    else:
+        pkg = params['name']
+        state = params['state']
+        enablerepo = params.get('enablerepo', '')
+        disablerepo = params.get('disablerepo', '')
+        disable_gpg_check = params['disable_gpg_check']
+        res = ensure(module, state, pkg, params['conf_file'], enablerepo,
+                     disablerepo, disable_gpg_check)
+        module.fail_json(msg="we should never get here unless this all failed", **res)
+
+# import module snippets
+# This code is part of Ansible, but is an independent component.
+# This particular file snippet, and this file snippet only, is BSD licensed.
+# Modules you write using this snippet, which is embedded dynamically by Ansible
+# still belong to the author of the module, and may assign their own license
+# to the complete work.
+# 
+# Copyright (c), Michael DeHaan <michael.dehaan@gmail.com>, 2012-2013
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without modification, 
+# are permitted provided that the following conditions are met:
+#
+#    * Redistributions of source code must retain the above copyright 
+#      notice, this list of conditions and the following disclaimer.
+#    * Redistributions in binary form must reproduce the above copyright notice, 
+#      this list of conditions and the following disclaimer in the documentation 
+#      and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED 
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. 
+# IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, 
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, 
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS 
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT 
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE 
+# USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+# == BEGIN DYNAMICALLY INSERTED CODE ==
+
+ANSIBLE_VERSION = '1.9.2'
+
+MODULE_ARGS = 'name=yum update_cache=yes'
+MODULE_COMPLEX_ARGS = '{}'
+
+BOOLEANS_TRUE = ['yes', 'on', '1', 'true', 1]
+BOOLEANS_FALSE = ['no', 'off', '0', 'false', 0]
+BOOLEANS = BOOLEANS_TRUE + BOOLEANS_FALSE
+
+SELINUX_SPECIAL_FS="fuse,nfs,vboxsf"
+
+# ansible modules can be written in any language.  To simplify
+# development of Python modules, the functions available here
+# can be inserted in any module source automatically by including
+# #<<INCLUDE_ANSIBLE_MODULE_COMMON>> on a blank line by itself inside
+# of an ansible module. The source of this common code lives
+# in lib/ansible/module_common.py
+
+import locale
+import os
+import re
+import pipes
+import shlex
+import subprocess
+import sys
+import syslog
+import types
+import time
+import select
+import shutil
+import stat
+import tempfile
+import traceback
+import grp
+import pwd
+import platform
+import errno
+import tempfile
+
+try:
+    import json
+except ImportError:
+    try:
+        import simplejson as json
+    except ImportError:
+        sys.stderr.write('Error: ansible requires a json module, none found!')
+        sys.exit(1)
+    except SyntaxError:
+        sys.stderr.write('SyntaxError: probably due to json and python being for different versions')
+        sys.exit(1)
+
+HAVE_SELINUX=False
+try:
+    import selinux
+    HAVE_SELINUX=True
+except ImportError:
+    pass
+
+HAVE_HASHLIB=False
+try:
+    from hashlib import sha1 as _sha1
+    HAVE_HASHLIB=True
+except ImportError:
+    from sha import sha as _sha1
+
+try:
+    from hashlib import md5 as _md5
+except ImportError:
+    try:
+        from md5 import md5 as _md5
+    except ImportError:
+        # MD5 unavailable.  Possibly FIPS mode
+        _md5 = None
+
+try:
+    from hashlib import sha256 as _sha256
+except ImportError:
+    pass
+
+try:
+    from systemd import journal
+    has_journal = True
+except ImportError:
+    import syslog
+    has_journal = False
+
+try:
+    from ast import literal_eval as _literal_eval
+except ImportError:
+    # a replacement for literal_eval that works with python 2.4. from: 
+    # https://mail.python.org/pipermail/python-list/2009-September/551880.html
+    # which is essentially a cut/past from an earlier (2.6) version of python's
+    # ast.py
+    from compiler import parse
+    from compiler.ast import *
+    def _literal_eval(node_or_string):
+        """
+        Safely evaluate an expression node or a string containing a Python
+        expression.  The string or node provided may only consist of the  following
+        Python literal structures: strings, numbers, tuples, lists, dicts,  booleans,
+        and None.
+        """
+        _safe_names = {'None': None, 'True': True, 'False': False}
+        if isinstance(node_or_string, basestring):
+            node_or_string = parse(node_or_string, mode='eval')
+        if isinstance(node_or_string, Expression):
+            node_or_string = node_or_string.node
+        def _convert(node):
+            if isinstance(node, Const) and isinstance(node.value, (basestring, int, float, long, complex)):
+                 return node.value
+            elif isinstance(node, Tuple):
+                return tuple(map(_convert, node.nodes))
+            elif isinstance(node, List):
+                return list(map(_convert, node.nodes))
+            elif isinstance(node, Dict):
+                return dict((_convert(k), _convert(v)) for k, v in node.items)
+            elif isinstance(node, Name):
+                if node.name in _safe_names:
+                    return _safe_names[node.name]
+            elif isinstance(node, UnarySub):
+                return -_convert(node.expr)
+            raise ValueError('malformed string')
+        return _convert(node_or_string)
+
+FILE_COMMON_ARGUMENTS=dict(
+    src = dict(),
+    mode = dict(),
+    owner = dict(),
+    group = dict(),
+    seuser = dict(),
+    serole = dict(),
+    selevel = dict(),
+    setype = dict(),
+    follow = dict(type='bool', default=False),
+    # not taken by the file module, but other modules call file so it must ignore them.
+    content = dict(no_log=True),
+    backup = dict(),
+    force = dict(),
+    remote_src = dict(), # used by assemble
+    regexp = dict(), # used by assemble
+    delimiter = dict(), # used by assemble
+    directory_mode = dict(), # used by copy
+)
+
+PASSWD_ARG_RE = re.compile(r'^[-]{0,2}pass[-]?(word|wd)?')
+
+def get_platform():
+    ''' what's the platform?  example: Linux is a platform. '''
+    return platform.system()
+
+def get_distribution():
+    ''' return the distribution name '''
+    if platform.system() == 'Linux':
+        try:
+            distribution = platform.linux_distribution()[0].capitalize()
+            if not distribution and os.path.isfile('/etc/system-release'):
+                distribution = platform.linux_distribution(supported_dists=['system'])[0].capitalize()
+                if 'Amazon' in distribution:
+                    distribution = 'Amazon'
+                else:
+                    distribution = 'OtherLinux'
+        except:
+            # FIXME: MethodMissing, I assume?
+            distribution = platform.dist()[0].capitalize()
+    else:
+        distribution = None
+    return distribution
+
+def get_distribution_version():
+    ''' return the distribution version '''
+    if platform.system() == 'Linux':
+        try:
+            distribution_version = platform.linux_distribution()[1]
+            if not distribution_version and os.path.isfile('/etc/system-release'):
+                distribution_version = platform.linux_distribution(supported_dists=['system'])[1]
+        except:
+            # FIXME: MethodMissing, I assume?
+            distribution_version = platform.dist()[1]
+    else:
+        distribution_version = None
+    return distribution_version
+
+def load_platform_subclass(cls, *args, **kwargs):
+    '''
+    used by modules like User to have different implementations based on detected platform.  See User
+    module for an example.
+    '''
+
+    this_platform = get_platform()
+    distribution = get_distribution()
+    subclass = None
+
+    # get the most specific superclass for this platform
+    if distribution is not None:
+        for sc in cls.__subclasses__():
+            if sc.distribution is not None and sc.distribution == distribution and sc.platform == this_platform:
+                subclass = sc
+    if subclass is None:
+        for sc in cls.__subclasses__():
+            if sc.platform == this_platform and sc.distribution is None:
+                subclass = sc
+    if subclass is None:
+        subclass = cls
+
+    return super(cls, subclass).__new__(subclass)
+
+
+def json_dict_unicode_to_bytes(d):
+    ''' Recursively convert dict keys and values to byte str
+
+        Specialized for json return because this only handles, lists, tuples,
+        and dict container types (the containers that the json module returns)
+    '''
+
+    if isinstance(d, unicode):
+        return d.encode('utf-8')
+    elif isinstance(d, dict):
+        return dict(map(json_dict_unicode_to_bytes, d.iteritems()))
+    elif isinstance(d, list):
+        return list(map(json_dict_unicode_to_bytes, d))
+    elif isinstance(d, tuple):
+        return tuple(map(json_dict_unicode_to_bytes, d))
+    else:
+        return d
+
+def json_dict_bytes_to_unicode(d):
+    ''' Recursively convert dict keys and values to byte str
+
+        Specialized for json return because this only handles, lists, tuples,
+        and dict container types (the containers that the json module returns)
+    '''
+
+    if isinstance(d, str):
+        return unicode(d, 'utf-8')
+    elif isinstance(d, dict):
+        return dict(map(json_dict_bytes_to_unicode, d.iteritems()))
+    elif isinstance(d, list):
+        return list(map(json_dict_bytes_to_unicode, d))
+    elif isinstance(d, tuple):
+        return tuple(map(json_dict_bytes_to_unicode, d))
+    else:
+        return d
+
+def heuristic_log_sanitize(data):
+    ''' Remove strings that look like passwords from log messages '''
+    # Currently filters:
+    # user:pass@foo/whatever and http://username:pass@wherever/foo
+    # This code has false positives and consumes parts of logs that are
+    # not passwds
+
+    # begin: start of a passwd containing string
+    # end: end of a passwd containing string
+    # sep: char between user and passwd
+    # prev_begin: where in the overall string to start a search for
+    #   a passwd
+    # sep_search_end: where in the string to end a search for the sep
+    output = []
+    begin = len(data)
+    prev_begin = begin
+    sep = 1
+    while sep:
+        # Find the potential end of a passwd
+        try:
+            end = data.rindex('@', 0, begin)
+        except ValueError:
+            # No passwd in the rest of the data
+            output.insert(0, data[0:begin])
+            break
+
+        # Search for the beginning of a passwd
+        sep = None
+        sep_search_end = end
+        while not sep:
+            # URL-style username+password
+            try:
+                begin = data.rindex('://', 0, sep_search_end)
+            except ValueError:
+                # No url style in the data, check for ssh style in the
+                # rest of the string
+                begin = 0
+            # Search for separator
+            try:
+                sep = data.index(':', begin + 3, end)
+            except ValueError:
+                # No separator; choices:
+                if begin == 0:
+                    # Searched the whole string so there's no password
+                    # here.  Return the remaining data
+                    output.insert(0, data[0:begin])
+                    break
+                # Search for a different beginning of the password field.
+                sep_search_end = begin
+                continue
+        if sep:
+            # Password was found; remove it.
+            output.insert(0, data[end:prev_begin])
+            output.insert(0, '********')
+            output.insert(0, data[begin:sep + 1])
+            prev_begin = begin
+
+    return ''.join(output)
+
+
+class AnsibleModule(object):
+
+    def __init__(self, argument_spec, bypass_checks=False, no_log=False,
+        check_invalid_arguments=True, mutually_exclusive=None, required_together=None,
+        required_one_of=None, add_file_common_args=False, supports_check_mode=False):
+
+        '''
+        common code for quickly building an ansible module in Python
+        (although you can write modules in anything that can return JSON)
+        see library/* for examples
+        '''
+
+        self.argument_spec = argument_spec
+        self.supports_check_mode = supports_check_mode
+        self.check_mode = False
+        self.no_log = no_log
+        self.cleanup_files = []
+        
+        self.aliases = {}
+        
+        if add_file_common_args:
+            for k, v in FILE_COMMON_ARGUMENTS.iteritems():
+                if k not in self.argument_spec:
+                    self.argument_spec[k] = v
+
+        # check the locale as set by the current environment, and
+        # reset to LANG=C if it's an invalid/unavailable locale
+        self._check_locale()
+
+        (self.params, self.args) = self._load_params()
+
+        self._legal_inputs = ['CHECKMODE', 'NO_LOG']
+        
+        self.aliases = self._handle_aliases()
+
+        if check_invalid_arguments:
+            self._check_invalid_arguments()
+        self._check_for_check_mode()
+        self._check_for_no_log()
+
+        # check exclusive early 
+        if not bypass_checks:
+            self._check_mutually_exclusive(mutually_exclusive)
+
+        self._set_defaults(pre=True)
+
+        if not bypass_checks:
+            self._check_required_arguments()
+            self._check_argument_values()
+            self._check_argument_types()
+            self._check_required_together(required_together)
+            self._check_required_one_of(required_one_of)
+
+        self._set_defaults(pre=False)
+        if not self.no_log:
+            self._log_invocation()
+
+        # finally, make sure we're in a sane working dir
+        self._set_cwd()
+
+    def load_file_common_arguments(self, params):
+        '''
+        many modules deal with files, this encapsulates common
+        options that the file module accepts such that it is directly
+        available to all modules and they can share code.
+        '''
+
+        path = params.get('path', params.get('dest', None))
+        if path is None:
+            return {}
+        else:
+            path = os.path.expanduser(path)
+
+        # if the path is a symlink, and we're following links, get
+        # the target of the link instead for testing
+        if params.get('follow', False) and os.path.islink(path):
+            path = os.path.realpath(path)
+
+        mode   = params.get('mode', None)
+        owner  = params.get('owner', None)
+        group  = params.get('group', None)
+
+        # selinux related options
+        seuser    = params.get('seuser', None)
+        serole    = params.get('serole', None)
+        setype    = params.get('setype', None)
+        selevel   = params.get('selevel', None)
+        secontext = [seuser, serole, setype]
+
+        if self.selinux_mls_enabled():
+            secontext.append(selevel)
+
+        default_secontext = self.selinux_default_context(path)
+        for i in range(len(default_secontext)):
+            if i is not None and secontext[i] == '_default':
+                secontext[i] = default_secontext[i]
+
+        return dict(
+            path=path, mode=mode, owner=owner, group=group,
+            seuser=seuser, serole=serole, setype=setype,
+            selevel=selevel, secontext=secontext,
+        )
+
+
+    # Detect whether using selinux that is MLS-aware.
+    # While this means you can set the level/range with
+    # selinux.lsetfilecon(), it may or may not mean that you
+    # will get the selevel as part of the context returned
+    # by selinux.lgetfilecon().
+
+    def selinux_mls_enabled(self):
+        if not HAVE_SELINUX:
+            return False
+        if selinux.is_selinux_mls_enabled() == 1:
+            return True
+        else:
+            return False
+
+    def selinux_enabled(self):
+        if not HAVE_SELINUX:
+            seenabled = self.get_bin_path('selinuxenabled')
+            if seenabled is not None:
+                (rc,out,err) = self.run_command(seenabled)
+                if rc == 0:
+                    self.fail_json(msg="Aborting, target uses selinux but python bindings (libselinux-python) aren't installed!")
+            return False
+        if selinux.is_selinux_enabled() == 1:
+            return True
+        else:
+            return False
+
+    # Determine whether we need a placeholder for selevel/mls
+    def selinux_initial_context(self):
+        context = [None, None, None]
+        if self.selinux_mls_enabled():
+            context.append(None)
+        return context
+
+    def _to_filesystem_str(self, path):
+        '''Returns filesystem path as a str, if it wasn't already.
+
+        Used in selinux interactions because it cannot accept unicode
+        instances, and specifying complex args in a playbook leaves
+        you with unicode instances.  This method currently assumes
+        that your filesystem encoding is UTF-8.
+
+        '''
+        if isinstance(path, unicode):
+            path = path.encode("utf-8")
+        return path
+
+    # If selinux fails to find a default, return an array of None
+    def selinux_default_context(self, path, mode=0):
+        context = self.selinux_initial_context()
+        if not HAVE_SELINUX or not self.selinux_enabled():
+            return context
+        try:
+            ret = selinux.matchpathcon(self._to_filesystem_str(path), mode)
+        except OSError:
+            return context
+        if ret[0] == -1:
+            return context
+        # Limit split to 4 because the selevel, the last in the list,
+        # may contain ':' characters
+        context = ret[1].split(':', 3)
+        return context
+
+    def selinux_context(self, path):
+        context = self.selinux_initial_context()
+        if not HAVE_SELINUX or not self.selinux_enabled():
+            return context
+        try:
+            ret = selinux.lgetfilecon_raw(self._to_filesystem_str(path))
+        except OSError, e:
+            if e.errno == errno.ENOENT:
+                self.fail_json(path=path, msg='path %s does not exist' % path)
+            else:
+                self.fail_json(path=path, msg='failed to retrieve selinux context')
+        if ret[0] == -1:
+            return context
+        # Limit split to 4 because the selevel, the last in the list,
+        # may contain ':' characters
+        context = ret[1].split(':', 3)
+        return context
+
+    def user_and_group(self, filename):
+        filename = os.path.expanduser(filename)
+        st = os.lstat(filename)
+        uid = st.st_uid
+        gid = st.st_gid
+        return (uid, gid)
+
+    def find_mount_point(self, path):
+        path = os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+        while not os.path.ismount(path):
+            path = os.path.dirname(path)
+        return path
+
+    def is_special_selinux_path(self, path):
+        """
+        Returns a tuple containing (True, selinux_context) if the given path is on a
+        NFS or other 'special' fs  mount point, otherwise the return will be (False, None).
+        """
+        try:
+            f = open('/proc/mounts', 'r')
+            mount_data = f.readlines()
+            f.close()
+        except:
+            return (False, None)
+        path_mount_point = self.find_mount_point(path)
+        for line in mount_data:
+            (device, mount_point, fstype, options, rest) = line.split(' ', 4)
+
+            if path_mount_point == mount_point:
+                for fs in SELINUX_SPECIAL_FS.split(','):
+                    if fs in fstype:
+                        special_context = self.selinux_context(path_mount_point)
+                        return (True, special_context)
+
+        return (False, None)
+
+    def set_default_selinux_context(self, path, changed):
+        if not HAVE_SELINUX or not self.selinux_enabled():
+            return changed
+        context = self.selinux_default_context(path)
+        return self.set_context_if_different(path, context, False)
+
+    def set_context_if_different(self, path, context, changed):
+
+        if not HAVE_SELINUX or not self.selinux_enabled():
+            return changed
+        cur_context = self.selinux_context(path)
+        new_context = list(cur_context)
+        # Iterate over the current context instead of the
+        # argument context, which may have selevel.
+
+        (is_special_se, sp_context) = self.is_special_selinux_path(path)
+        if is_special_se:
+            new_context = sp_context
+        else:
+            for i in range(len(cur_context)):
+                if len(context) > i:
+                    if context[i] is not None and context[i] != cur_context[i]:
+                        new_context[i] = context[i]
+                    if context[i] is None:
+                        new_context[i] = cur_context[i]
+
+        if cur_context != new_context:
+            try:
+                if self.check_mode:
+                    return True
+                rc = selinux.lsetfilecon(self._to_filesystem_str(path),
+                                         str(':'.join(new_context)))
+            except OSError:
+                self.fail_json(path=path, msg='invalid selinux context', new_context=new_context, cur_context=cur_context, input_was=context)
+            if rc != 0:
+                self.fail_json(path=path, msg='set selinux context failed')
+            changed = True
+        return changed
+
+    def set_owner_if_different(self, path, owner, changed):
+        path = os.path.expanduser(path)
+        if owner is None:
+            return changed
+        orig_uid, orig_gid = self.user_and_group(path)
+        try:
+            uid = int(owner)
+        except ValueError:
+            try:
+                uid = pwd.getpwnam(owner).pw_uid
+            except KeyError:
+                self.fail_json(path=path, msg='chown failed: failed to look up user %s' % owner)
+        if orig_uid != uid:
+            if self.check_mode:
+                return True
+            try:
+                os.lchown(path, uid, -1)
+            except OSError:
+                self.fail_json(path=path, msg='chown failed')
+            changed = True
+        return changed
+
+    def set_group_if_different(self, path, group, changed):
+        path = os.path.expanduser(path)
+        if group is None:
+            return changed
+        orig_uid, orig_gid = self.user_and_group(path)
+        try:
+            gid = int(group)
+        except ValueError:
+            try:
+                gid = grp.getgrnam(group).gr_gid
+            except KeyError:
+                self.fail_json(path=path, msg='chgrp failed: failed to look up group %s' % group)
+        if orig_gid != gid:
+            if self.check_mode:
+                return True
+            try:
+                os.lchown(path, -1, gid)
+            except OSError:
+                self.fail_json(path=path, msg='chgrp failed')
+            changed = True
+        return changed
+
+    def set_mode_if_different(self, path, mode, changed):
+        path = os.path.expanduser(path)
+        path_stat = os.lstat(path)
+
+        if mode is None:
+            return changed
+
+        if not isinstance(mode, int):
+            try:
+                mode = int(mode, 8)
+            except Exception:
+                try:
+                    mode = self._symbolic_mode_to_octal(path_stat, mode)
+                except Exception, e:
+                    self.fail_json(path=path,
+                                   msg="mode must be in octal or symbolic form",
+                                   details=str(e))
+
+        prev_mode = stat.S_IMODE(path_stat.st_mode)
+
+        if prev_mode != mode:
+            if self.check_mode:
+                return True
+            # FIXME: comparison against string above will cause this to be executed
+            # every time
+            try:
+                if hasattr(os, 'lchmod'):
+                    os.lchmod(path, mode)
+                else:
+                    if not os.path.islink(path):
+                        os.chmod(path, mode)
+                    else:
+                        # Attempt to set the perms of the symlink but be
+                        # careful not to change the perms of the underlying
+                        # file while trying
+                        underlying_stat = os.stat(path)
+                        os.chmod(path, mode)
+                        new_underlying_stat = os.stat(path)
+                        if underlying_stat.st_mode != new_underlying_stat.st_mode:
+                            os.chmod(path, stat.S_IMODE(underlying_stat.st_mode))
+                        q_stat = os.stat(path)
+            except OSError, e:
+                if os.path.islink(path) and e.errno == errno.EPERM:  # Can't set mode on symbolic links
+                    pass
+                elif e.errno in (errno.ENOENT, errno.ELOOP): # Can't set mode on broken symbolic links
+                    pass
+                else:
+                    raise e
+            except Exception, e:
+                self.fail_json(path=path, msg='chmod failed', details=str(e))
+
+            path_stat = os.lstat(path)
+            new_mode = stat.S_IMODE(path_stat.st_mode)
+
+            if new_mode != prev_mode:
+                changed = True
+        return changed
+
+    def _symbolic_mode_to_octal(self, path_stat, symbolic_mode):
+        new_mode = stat.S_IMODE(path_stat.st_mode)
+
+        mode_re = re.compile(r'^(?P<users>[ugoa]+)(?P<operator>[-+=])(?P<perms>[rwxXst]*|[ugo])$')
+        for mode in symbolic_mode.split(','):
+            match = mode_re.match(mode)
+            if match:
+                users = match.group('users')
+                operator = match.group('operator')
+                perms = match.group('perms')
+
+                if users == 'a': users = 'ugo'
+
+                for user in users:
+                    mode_to_apply = self._get_octal_mode_from_symbolic_perms(path_stat, user, perms)
+                    new_mode = self._apply_operation_to_mode(user, operator, mode_to_apply, new_mode)
+            else:
+                raise ValueError("bad symbolic permission for mode: %s" % mode)
+        return new_mode
+    
+    def _apply_operation_to_mode(self, user, operator, mode_to_apply, current_mode):
+        if operator  ==  '=':
+            if user == 'u': mask = stat.S_IRWXU | stat.S_ISUID
+            elif user == 'g': mask = stat.S_IRWXG | stat.S_ISGID
+            elif user == 'o': mask = stat.S_IRWXO | stat.S_ISVTX
+            
+            # mask out u, g, or o permissions from current_mode and apply new permissions   
+            inverse_mask = mask ^ 07777
+            new_mode = (current_mode & inverse_mask) | mode_to_apply
+        elif operator == '+':
+            new_mode = current_mode | mode_to_apply
+        elif operator == '-':
+            new_mode = current_mode - (current_mode & mode_to_apply)
+        return new_mode
+        
+    def _get_octal_mode_from_symbolic_perms(self, path_stat, user, perms):
+        prev_mode = stat.S_IMODE(path_stat.st_mode)
+        
+        is_directory = stat.S_ISDIR(path_stat.st_mode)
+        has_x_permissions = (prev_mode & 00111) > 0
+        apply_X_permission = is_directory or has_x_permissions
+
+        # Permission bits constants documented at:
+        # http://docs.python.org/2/library/stat.html#stat.S_ISUID
+        if apply_X_permission:
+            X_perms = {
+                'u': {'X': stat.S_IXUSR},
+                'g': {'X': stat.S_IXGRP},
+                'o': {'X': stat.S_IXOTH}
+            }
+        else:
+            X_perms = {
+                'u': {'X': 0},
+                'g': {'X': 0},
+                'o': {'X': 0}
+            }
+
+        user_perms_to_modes = {
+            'u': {
+                'r': stat.S_IRUSR,
+                'w': stat.S_IWUSR,
+                'x': stat.S_IXUSR,
+                's': stat.S_ISUID,
+                't': 0,
+                'u': prev_mode & stat.S_IRWXU,
+                'g': (prev_mode & stat.S_IRWXG) << 3,
+                'o': (prev_mode & stat.S_IRWXO) << 6 },
+            'g': {
+                'r': stat.S_IRGRP,
+                'w': stat.S_IWGRP,
+                'x': stat.S_IXGRP,
+                's': stat.S_ISGID,
+                't': 0,
+                'u': (prev_mode & stat.S_IRWXU) >> 3,
+                'g': prev_mode & stat.S_IRWXG,
+                'o': (prev_mode & stat.S_IRWXO) << 3 },
+            'o': {
+                'r': stat.S_IROTH,
+                'w': stat.S_IWOTH,
+                'x': stat.S_IXOTH,
+                's': 0,
+                't': stat.S_ISVTX,
+                'u': (prev_mode & stat.S_IRWXU) >> 6,
+                'g': (prev_mode & stat.S_IRWXG) >> 3,
+                'o': prev_mode & stat.S_IRWXO }
+        }
+
+        # Insert X_perms into user_perms_to_modes
+        for key, value in X_perms.items():
+            user_perms_to_modes[key].update(value)
+
+        or_reduce = lambda mode, perm: mode | user_perms_to_modes[user][perm]
+        return reduce(or_reduce, perms, 0)
+
+    def set_fs_attributes_if_different(self, file_args, changed):
+        # set modes owners and context as needed
+        changed = self.set_context_if_different(
+            file_args['path'], file_args['secontext'], changed
+        )
+        changed = self.set_owner_if_different(
+            file_args['path'], file_args['owner'], changed
+        )
+        changed = self.set_group_if_different(
+            file_args['path'], file_args['group'], changed
+        )
+        changed = self.set_mode_if_different(
+            file_args['path'], file_args['mode'], changed
+        )
+        return changed
+
+    def set_directory_attributes_if_different(self, file_args, changed):
+        return self.set_fs_attributes_if_different(file_args, changed)
+
+    def set_file_attributes_if_different(self, file_args, changed):
+        return self.set_fs_attributes_if_different(file_args, changed)
+
+    def add_path_info(self, kwargs):
+        '''
+        for results that are files, supplement the info about the file
+        in the return path with stats about the file path.
+        '''
+
+        path = kwargs.get('path', kwargs.get('dest', None))
+        if path is None:
+            return kwargs
+        if os.path.exists(path):
+            (uid, gid) = self.user_and_group(path)
+            kwargs['uid'] = uid
+            kwargs['gid'] = gid
+            try:
+                user = pwd.getpwuid(uid)[0]
+            except KeyError:
+                user = str(uid)
+            try:
+                group = grp.getgrgid(gid)[0]
+            except KeyError:
+                group = str(gid)
+            kwargs['owner'] = user
+            kwargs['group'] = group
+            st = os.lstat(path)
+            kwargs['mode']  = oct(stat.S_IMODE(st[stat.ST_MODE]))
+            # secontext not yet supported
+            if os.path.islink(path):
+                kwargs['state'] = 'link'
+            elif os.path.isdir(path):
+                kwargs['state'] = 'directory'
+            elif os.stat(path).st_nlink > 1:
+                kwargs['state'] = 'hard'
+            else:
+                kwargs['state'] = 'file'
+            if HAVE_SELINUX and self.selinux_enabled():
+                kwargs['secontext'] = ':'.join(self.selinux_context(path))
+            kwargs['size'] = st[stat.ST_SIZE]
+        else:
+            kwargs['state'] = 'absent'
+        return kwargs
+
+    def _check_locale(self):
+        '''
+        Uses the locale module to test the currently set locale
+        (per the LANG and LC_CTYPE environment settings)
+        '''
+        try:
+            # setting the locale to '' uses the default locale
+            # as it would be returned by locale.getdefaultlocale()
+            locale.setlocale(locale.LC_ALL, '')
+        except locale.Error, e:
+            # fallback to the 'C' locale, which may cause unicode
+            # issues but is preferable to simply failing because
+            # of an unknown locale
+            locale.setlocale(locale.LC_ALL, 'C')
+            os.environ['LANG']     = 'C'
+            os.environ['LC_CTYPE'] = 'C'
+        except Exception, e:
+            self.fail_json(msg="An unknown error was encountered while attempting to validate the locale: %s" % e)
+
+    def _handle_aliases(self):
+        aliases_results = {} #alias:canon
+        for (k,v) in self.argument_spec.iteritems():
+            self._legal_inputs.append(k)
+            aliases = v.get('aliases', None)
+            default = v.get('default', None)
+            required = v.get('required', False)
+            if default is not None and required:
+                # not alias specific but this is a good place to check this
+                self.fail_json(msg="internal error: required and default are mutually exclusive for %s" % k)
+            if aliases is None:
+                continue
+            if type(aliases) != list:
+                self.fail_json(msg='internal error: aliases must be a list')
+            for alias in aliases:
+                self._legal_inputs.append(alias)
+                aliases_results[alias] = k
+                if alias in self.params:
+                    self.params[k] = self.params[alias]
+        
+        return aliases_results
+
+    def _check_for_check_mode(self):
+        for (k,v) in self.params.iteritems():
+            if k == 'CHECKMODE':
+                if not self.supports_check_mode:
+                    self.exit_json(skipped=True, msg="remote module does not support check mode")
+                if self.supports_check_mode:
+                    self.check_mode = True
+
+    def _check_for_no_log(self):
+        for (k,v) in self.params.iteritems():
+            if k == 'NO_LOG':
+                self.no_log = self.boolean(v)
+
+    def _check_invalid_arguments(self):
+        for (k,v) in self.params.iteritems():
+            # these should be in legal inputs already
+            #if k in ('CHECKMODE', 'NO_LOG'):
+            #    continue
+            if k not in self._legal_inputs:
+                self.fail_json(msg="unsupported parameter for module: %s" % k)
+
+    def _count_terms(self, check):
+        count = 0
+        for term in check:
+            if term in self.params:
+                count += 1
+        return count
+
+    def _check_mutually_exclusive(self, spec):
+        if spec is None:
+            return
+        for check in spec:
+            count = self._count_terms(check)
+            if count > 1:
+                self.fail_json(msg="parameters are mutually exclusive: %s" % check)
+
+    def _check_required_one_of(self, spec):
+        if spec is None:
+            return
+        for check in spec:
+            count = self._count_terms(check)
+            if count == 0:
+                self.fail_json(msg="one of the following is required: %s" % ','.join(check))
+
+    def _check_required_together(self, spec):
+        if spec is None:
+            return
+        for check in spec:
+            counts = [ self._count_terms([field]) for field in check ]
+            non_zero = [ c for c in counts if c > 0 ]
+            if len(non_zero) > 0:
+                if 0 in counts:
+                    self.fail_json(msg="parameters are required together: %s" % check)
+
+    def _check_required_arguments(self):
+        ''' ensure all required arguments are present '''
+        missing = []
+        for (k,v) in self.argument_spec.iteritems():
+            required = v.get('required', False)
+            if required and k not in self.params:
+                missing.append(k)
+        if len(missing) > 0:
+            self.fail_json(msg="missing required arguments: %s" % ",".join(missing))
+
+    def _check_argument_values(self):
+        ''' ensure all arguments have the requested values, and there are no stray arguments '''
+        for (k,v) in self.argument_spec.iteritems():
+            choices = v.get('choices',None)
+            if choices is None:
+                continue
+            if type(choices) == list:
+                if k in self.params:
+                    if self.params[k] not in choices:
+                        choices_str=",".join([str(c) for c in choices])
+                        msg="value of %s must be one of: %s, got: %s" % (k, choices_str, self.params[k])
+                        self.fail_json(msg=msg)
+            else:
+                self.fail_json(msg="internal error: do not know how to interpret argument_spec")
+
+    def safe_eval(self, str, locals=None, include_exceptions=False):
+
+        # do not allow method calls to modules
+        if not isinstance(str, basestring):
+            # already templated to a datastructure, perhaps?
+            if include_exceptions:
+                return (str, None)
+            return str
+        if re.search(r'\w\.\w+\(', str):
+            if include_exceptions:
+                return (str, None)
+            return str
+        # do not allow imports
+        if re.search(r'import \w+', str):
+            if include_exceptions:
+                return (str, None)
+            return str
+        try:
+            result = None
+            if not locals:
+                result = _literal_eval(str)
+            else:
+                result = _literal_eval(str, None, locals)
+            if include_exceptions:
+                return (result, None)
+            else:
+                return result
+        except Exception, e:
+            if include_exceptions:
+                return (str, e)
+            return str
+
+    def _check_argument_types(self):
+        ''' ensure all arguments have the requested type '''
+        for (k, v) in self.argument_spec.iteritems():
+            wanted = v.get('type', None)
+            if wanted is None:
+                continue
+            if k not in self.params:
+                continue
+
+            value = self.params[k]
+            is_invalid = False
+
+            if wanted == 'str':
+                if not isinstance(value, basestring):
+                    self.params[k] = str(value)
+            elif wanted == 'list':
+                if not isinstance(value, list):
+                    if isinstance(value, basestring):
+                        self.params[k] = value.split(",")
+                    elif isinstance(value, int) or isinstance(value, float):
+                        self.params[k] = [ str(value) ]
+                    else:
+                        is_invalid = True
+            elif wanted == 'dict':
+                if not isinstance(value, dict):
+                    if isinstance(value, basestring):
+                        if value.startswith("{"):
+                            try:
+                                self.params[k] = json.loads(value)
+                            except:
+                                (result, exc) = self.safe_eval(value, dict(), include_exceptions=True)
+                                if exc is not None:
+                                    self.fail_json(msg="unable to evaluate dictionary for %s" % k)
+                                self.params[k] = result
+                        elif '=' in value:
+                            self.params[k] = dict([x.strip().split("=", 1) for x in value.split(",")])
+                        else:
+                            self.fail_json(msg="dictionary requested, could not parse JSON or key=value")
+                    else:
+                        is_invalid = True
+            elif wanted == 'bool':
+                if not isinstance(value, bool):
+                    if isinstance(value, basestring):
+                        self.params[k] = self.boolean(value)
+                    else:
+                        is_invalid = True
+            elif wanted == 'int':
+                if not isinstance(value, int):
+                    if isinstance(value, basestring):
+                        self.params[k] = int(value)
+                    else:
+                        is_invalid = True
+            elif wanted == 'float':
+                if not isinstance(value, float):
+                    if isinstance(value, basestring):
+                        self.params[k] = float(value)
+                    else:
+                        is_invalid = True
+            else:
+                self.fail_json(msg="implementation error: unknown type %s requested for %s" % (wanted, k))
+
+            if is_invalid:
+                self.fail_json(msg="argument %s is of invalid type: %s, required: %s" % (k, type(value), wanted))
+
+    def _set_defaults(self, pre=True):
+        for (k,v) in self.argument_spec.iteritems():
+            default = v.get('default', None)
+            if pre == True:
+                # this prevents setting defaults on required items
+                if default is not None and k not in self.params:
+                    self.params[k] = default
+            else:
+                # make sure things without a default still get set None
+                if k not in self.params:
+                    self.params[k] = default
+
+    def _load_params(self):
+        ''' read the input and return a dictionary and the arguments string '''
+        args = MODULE_ARGS
+        items   = shlex.split(args)
+        params = {}
+        for x in items:
+            try:
+                (k, v) = x.split("=",1)
+            except Exception, e:
+                self.fail_json(msg="this module requires key=value arguments (%s)" % (items))
+            if k in params:
+                self.fail_json(msg="duplicate parameter: %s (value=%s)" % (k, v))
+            params[k] = v
+        params2 = json_dict_unicode_to_bytes(json.loads(MODULE_COMPLEX_ARGS))
+        params2.update(params)
+        return (params2, args)
+
+    def _log_invocation(self):
+        ''' log that ansible ran the module '''
+        # TODO: generalize a separate log function and make log_invocation use it
+        # Sanitize possible password argument when logging.
+        log_args = dict()
+        passwd_keys = ['password', 'login_password']
+
+        for param in self.params:
+            canon  = self.aliases.get(param, param)
+            arg_opts = self.argument_spec.get(canon, {})
+            no_log = arg_opts.get('no_log', False)
+
+            if self.boolean(no_log):
+                log_args[param] = 'NOT_LOGGING_PARAMETER'
+            elif param in passwd_keys:
+                log_args[param] = 'NOT_LOGGING_PASSWORD'
+            else:
+                param_val = self.params[param]
+                if not isinstance(param_val, basestring):
+                    param_val = str(param_val)
+                elif isinstance(param_val, unicode):
+                    param_val = param_val.encode('utf-8')
+                log_args[param] = heuristic_log_sanitize(param_val)
+
+        module = 'ansible-%s' % os.path.basename(__file__)
+        msg = []
+        for arg in log_args:
+            arg_val = log_args[arg]
+            if not isinstance(arg_val, basestring):
+                arg_val = str(arg_val)
+            elif isinstance(arg_val, unicode):
+                arg_val = arg_val.encode('utf-8')
+            msg.append('%s=%s ' % (arg, arg_val))
+        if msg:
+            msg = 'Invoked with %s' % ''.join(msg)
+        else:
+            msg = 'Invoked'
+
+        # 6655 - allow for accented characters
+        if isinstance(msg, unicode):
+            # We should never get here as msg should be type str, not unicode
+            msg = msg.encode('utf-8')
+
+        if (has_journal):
+            journal_args = [("MODULE", os.path.basename(__file__))]
+            for arg in log_args:
+                journal_args.append((arg.upper(), str(log_args[arg])))
+            try:
+                journal.send("%s %s" % (module, msg), **dict(journal_args))
+            except IOError, e:
+                # fall back to syslog since logging to journal failed
+                syslog.openlog(str(module), 0, syslog.LOG_USER)
+                syslog.syslog(syslog.LOG_NOTICE, msg) #1
+        else:
+            syslog.openlog(str(module), 0, syslog.LOG_USER)
+            syslog.syslog(syslog.LOG_NOTICE, msg) #2
+
+    def _set_cwd(self):
+        try:
+            cwd = os.getcwd()
+            if not os.access(cwd, os.F_OK|os.R_OK):
+                raise
+            return cwd
+        except:
+            # we don't have access to the cwd, probably because of sudo. 
+            # Try and move to a neutral location to prevent errors
+            for cwd in [os.path.expandvars('$HOME'), tempfile.gettempdir()]:
+                try:
+                    if os.access(cwd, os.F_OK|os.R_OK):
+                        os.chdir(cwd)
+                        return cwd
+                except:
+                    pass
+        # we won't error here, as it may *not* be a problem, 
+        # and we don't want to break modules unnecessarily
+        return None    
+
+    def get_bin_path(self, arg, required=False, opt_dirs=[]):
+        '''
+        find system executable in PATH.
+        Optional arguments:
+           - required:  if executable is not found and required is true, fail_json
+           - opt_dirs:  optional list of directories to search in addition to PATH
+        if found return full path; otherwise return None
+        '''
+        sbin_paths = ['/sbin', '/usr/sbin', '/usr/local/sbin']
+        paths = []
+        for d in opt_dirs:
+            if d is not None and os.path.exists(d):
+                paths.append(d)
+        paths += os.environ.get('PATH', '').split(os.pathsep)
+        bin_path = None
+        # mangle PATH to include /sbin dirs
+        for p in sbin_paths:
+            if p not in paths and os.path.exists(p):
+                paths.append(p)
+        for d in paths:
+            path = os.path.join(d, arg)
+            if os.path.exists(path) and self.is_executable(path):
+                bin_path = path
+                break
+        if required and bin_path is None:
+            self.fail_json(msg='Failed to find required executable %s' % arg)
+        return bin_path
+
+    def boolean(self, arg):
+        ''' return a bool for the arg '''
+        if arg is None or type(arg) == bool:
+            return arg
+        if type(arg) in types.StringTypes:
+            arg = arg.lower()
+        if arg in BOOLEANS_TRUE:
+            return True
+        elif arg in BOOLEANS_FALSE:
+            return False
+        else:
+            self.fail_json(msg='Boolean %s not in either boolean list' % arg)
+
+    def jsonify(self, data):
+        for encoding in ("utf-8", "latin-1", "unicode_escape"):
+            try:
+                return json.dumps(data, encoding=encoding)
+            # Old systems using simplejson module does not support encoding keyword.
+            except TypeError, e:
+                return json.dumps(data)
+            except UnicodeDecodeError, e:
+                continue
+        self.fail_json(msg='Invalid unicode encoding encountered')
+
+    def from_json(self, data):
+        return json.loads(data)
+
+    def add_cleanup_file(self, path):
+        if path not in self.cleanup_files:
+            self.cleanup_files.append(path)
+
+    def do_cleanup_files(self):
+        for path in self.cleanup_files:
+            self.cleanup(path)
+
+    def exit_json(self, **kwargs):
+        ''' return from the module, without error '''
+        self.add_path_info(kwargs)
+        if not 'changed' in kwargs:
+            kwargs['changed'] = False
+        self.do_cleanup_files()
+        print self.jsonify(kwargs)
+        sys.exit(0)
+
+    def fail_json(self, **kwargs):
+        ''' return from the module, with an error message '''
+        self.add_path_info(kwargs)
+        assert 'msg' in kwargs, "implementation error -- msg to explain the error is required"
+        kwargs['failed'] = True
+        self.do_cleanup_files()
+        print self.jsonify(kwargs)
+        sys.exit(1)
+
+    def is_executable(self, path):
+        '''is the given path executable?'''
+        return (stat.S_IXUSR & os.stat(path)[stat.ST_MODE]
+                or stat.S_IXGRP & os.stat(path)[stat.ST_MODE]
+                or stat.S_IXOTH & os.stat(path)[stat.ST_MODE])
+
+    def digest_from_file(self, filename, digest_method):
+        ''' Return hex digest of local file for a given digest_method, or None if file is not present. '''
+        if not os.path.exists(filename):
+            return None
+        if os.path.isdir(filename):
+            self.fail_json(msg="attempted to take checksum of directory: %s" % filename)
+        digest = digest_method
+        blocksize = 64 * 1024
+        infile = open(filename, 'rb')
+        block = infile.read(blocksize)
+        while block:
+            digest.update(block)
+            block = infile.read(blocksize)
+        infile.close()
+        return digest.hexdigest()
+
+    def md5(self, filename):
+        ''' Return MD5 hex digest of local file using digest_from_file().
+
+        Do not use this function unless you have no other choice for:
+            1) Optional backwards compatibility
+            2) Compatibility with a third party protocol
+
+        This function will not work on systems complying with FIPS-140-2.
+
+        Most uses of this function can use the module.sha1 function instead.
+        '''
+        if not _md5:
+            raise ValueError('MD5 not available.  Possibly running in FIPS mode')
+        return self.digest_from_file(filename, _md5())
+
+    def sha1(self, filename):
+        ''' Return SHA1 hex digest of local file using digest_from_file(). '''
+        return self.digest_from_file(filename, _sha1())
+
+    def sha256(self, filename):
+        ''' Return SHA-256 hex digest of local file using digest_from_file(). '''
+        if not HAVE_HASHLIB:
+            self.fail_json(msg="SHA-256 checksums require hashlib, which is available in Python 2.5 and higher")
+        return self.digest_from_file(filename, _sha256())
+
+    def backup_local(self, fn):
+        '''make a date-marked backup of the specified file, return True or False on success or failure'''
+        # backups named basename-YYYY-MM-DD@HH:MM:SS~
+        ext = time.strftime("%Y-%m-%d@%H:%M:%S~", time.localtime(time.time()))
+        backupdest = '%s.%s' % (fn, ext)
+
+        try:
+            shutil.copy2(fn, backupdest)
+        except (shutil.Error, IOError), e:
+            self.fail_json(msg='Could not make backup of %s to %s: %s' % (fn, backupdest, e))
+        return backupdest
+
+    def cleanup(self, tmpfile):
+        if os.path.exists(tmpfile):
+            try:
+                os.unlink(tmpfile)
+            except OSError, e:
+                sys.stderr.write("could not cleanup %s: %s" % (tmpfile, e))
+
+    def atomic_move(self, src, dest):
+        '''atomically move src to dest, copying attributes from dest, returns true on success
+        it uses os.rename to ensure this as it is an atomic operation, rest of the function is
+        to work around limitations, corner cases and ensure selinux context is saved if possible'''
+        context = None
+        dest_stat = None
+        if os.path.exists(dest):
+            try:
+                dest_stat = os.stat(dest)
+                os.chmod(src, dest_stat.st_mode & 07777)
+                os.chown(src, dest_stat.st_uid, dest_stat.st_gid)
+            except OSError, e:
+                if e.errno != errno.EPERM:
+                    raise
+            if self.selinux_enabled():
+                context = self.selinux_context(dest)
+        else:
+            if self.selinux_enabled():
+                context = self.selinux_default_context(dest)
+
+        creating = not os.path.exists(dest)
+
+        try:
+            login_name = os.getlogin()
+        except OSError:
+            # not having a tty can cause the above to fail, so
+            # just get the LOGNAME environment variable instead
+            login_name = os.environ.get('LOGNAME', None)
+
+        # if the original login_name doesn't match the currently
+        # logged-in user, or if the SUDO_USER environment variable
+        # is set, then this user has switched their credentials
+        switched_user = login_name and login_name != pwd.getpwuid(os.getuid())[0] or os.environ.get('SUDO_USER')
+
+        try:
+            # Optimistically try a rename, solves some corner cases and can avoid useless work, throws exception if not atomic.
+            os.rename(src, dest)
+        except (IOError,OSError), e:
+            # only try workarounds for errno 18 (cross device), 1 (not permitted) and 13 (permission denied)
+            if e.errno != errno.EPERM and e.errno != errno.EXDEV and e.errno != errno.EACCES:
+                self.fail_json(msg='Could not replace file: %s to %s: %s' % (src, dest, e))
+
+            dest_dir = os.path.dirname(dest)
+            dest_file = os.path.basename(dest)
+            try:
+                tmp_dest = tempfile.NamedTemporaryFile(
+                    prefix=".ansible_tmp", dir=dest_dir, suffix=dest_file)
+            except (OSError, IOError), e:
+                self.fail_json(msg='The destination directory (%s) is not writable by the current user.' % dest_dir)
+
+            try: # leaves tmp file behind when sudo and  not root
+                if switched_user and os.getuid() != 0:
+                    # cleanup will happen by 'rm' of tempdir
+                    # copy2 will preserve some metadata
+                    shutil.copy2(src, tmp_dest.name)
+                else:
+                    shutil.move(src, tmp_dest.name)
+                if self.selinux_enabled():
+                    self.set_context_if_different(
+                        tmp_dest.name, context, False)
+                try:
+                    tmp_stat = os.stat(tmp_dest.name)
+                    if dest_stat and (tmp_stat.st_uid != dest_stat.st_uid or tmp_stat.st_gid != dest_stat.st_gid):
+                        os.chown(tmp_dest.name, dest_stat.st_uid, dest_stat.st_gid)
+                except OSError, e:
+                    if e.errno != errno.EPERM:
+                        raise
+                os.rename(tmp_dest.name, dest)
+            except (shutil.Error, OSError, IOError), e:
+                self.cleanup(tmp_dest.name)
+                self.fail_json(msg='Could not replace file: %s to %s: %s' % (src, dest, e))
+
+        if creating:
+            # make sure the file has the correct permissions
+            # based on the current value of umask
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(dest, 0666 & ~umask)
+            if switched_user:
+                os.chown(dest, os.getuid(), os.getgid())
+
+        if self.selinux_enabled():
+            # rename might not preserve context
+            self.set_context_if_different(dest, context, False)
+
+    def run_command(self, args, check_rc=False, close_fds=True, executable=None, data=None, binary_data=False, path_prefix=None, cwd=None, use_unsafe_shell=False, prompt_regex=None):
+        '''
+        Execute a command, returns rc, stdout, and stderr.
+        args is the command to run
+        If args is a list, the command will be run with shell=False.
+        If args is a string and use_unsafe_shell=False it will split args to a list and run with shell=False
+        If args is a string and use_unsafe_shell=True it run with shell=True.
+        Other arguments:
+        - check_rc (boolean)    Whether to call fail_json in case of
+                                non zero RC.  Default is False.
+        - close_fds (boolean)   See documentation for subprocess.Popen().
+                                Default is True.
+        - executable (string)   See documentation for subprocess.Popen().
+                                Default is None.
+        - prompt_regex (string) A regex string (not a compiled regex) which
+                                can be used to detect prompts in the stdout
+                                which would otherwise cause the execution
+                                to hang (especially if no input data is
+                                specified)
+        '''
+
+        shell = False
+        if isinstance(args, list):
+            if use_unsafe_shell:
+                args = " ".join([pipes.quote(x) for x in args])
+                shell = True
+        elif isinstance(args, basestring) and use_unsafe_shell:
+            shell = True
+        elif isinstance(args, basestring):
+            args = shlex.split(args.encode('utf-8'))
+        else:
+            msg = "Argument 'args' to run_command must be list or string"
+            self.fail_json(rc=257, cmd=args, msg=msg)
+
+        prompt_re = None
+        if prompt_regex:
+            try:
+                prompt_re = re.compile(prompt_regex, re.MULTILINE)
+            except re.error:
+                self.fail_json(msg="invalid prompt regular expression given to run_command")
+
+        # expand things like $HOME and ~
+        if not shell:
+            args = [ os.path.expandvars(os.path.expanduser(x)) for x in args ]
+
+        rc = 0
+        msg = None
+        st_in = None
+
+        # Set a temporart env path if a prefix is passed
+        env=os.environ
+        if path_prefix:
+            env['PATH']="%s:%s" % (path_prefix, env['PATH'])
+
+        # create a printable version of the command for use
+        # in reporting later, which strips out things like
+        # passwords from the args list
+        if isinstance(args, basestring):
+            if isinstance(args, unicode):
+                b_args = args.encode('utf-8')
+            else:
+                b_args = args
+            to_clean_args = shlex.split(b_args)
+            del b_args
+        else:
+            to_clean_args = args
+
+        clean_args = []
+        is_passwd = False
+        for arg in to_clean_args:
+            if is_passwd:
+                is_passwd = False
+                clean_args.append('********')
+                continue
+            if PASSWD_ARG_RE.match(arg):
+                sep_idx = arg.find('=')
+                if sep_idx > -1:
+                    clean_args.append('%s=********' % arg[:sep_idx])
+                    continue
+                else:
+                    is_passwd = True
+            clean_args.append(heuristic_log_sanitize(arg))
+        clean_args = ' '.join(pipes.quote(arg) for arg in clean_args)
+
+        if data:
+            st_in = subprocess.PIPE
+
+        kwargs = dict(
+            executable=executable,
+            shell=shell,
+            close_fds=close_fds,
+            stdin=st_in,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE 
+        )
+
+        if path_prefix:
+            kwargs['env'] = env
+        if cwd and os.path.isdir(cwd):
+            kwargs['cwd'] = cwd
+
+        # store the pwd
+        prev_dir = os.getcwd()
+
+        # make sure we're in the right working directory
+        if cwd and os.path.isdir(cwd):
+            try:
+                os.chdir(cwd)
+            except (OSError, IOError), e:
+                self.fail_json(rc=e.errno, msg="Could not open %s, %s" % (cwd, str(e)))
+
+        try:
+            cmd = subprocess.Popen(args, **kwargs)
+
+            # the communication logic here is essentially taken from that
+            # of the _communicate() function in ssh.py
+
+            stdout = ''
+            stderr = ''
+            rpipes = [cmd.stdout, cmd.stderr]
+
+            if data:
+                if not binary_data:
+                    data += '\n'
+                cmd.stdin.write(data)
+                cmd.stdin.close()
+
+            while True:
+                rfd, wfd, efd = select.select(rpipes, [], rpipes, 1)
+                if cmd.stdout in rfd:
+                    dat = os.read(cmd.stdout.fileno(), 9000)
+                    stdout += dat
+                    if dat == '':
+                        rpipes.remove(cmd.stdout)
+                if cmd.stderr in rfd:
+                    dat = os.read(cmd.stderr.fileno(), 9000)
+                    stderr += dat
+                    if dat == '':
+                        rpipes.remove(cmd.stderr)
+                # if we're checking for prompts, do it now
+                if prompt_re:
+                    if prompt_re.search(stdout) and not data:
+                         return (257, stdout, "A prompt was encountered while running a command, but no input data was specified")
+                # only break out if no pipes are left to read or
+                # the pipes are completely read and
+                # the process is terminated
+                if (not rpipes or not rfd) and cmd.poll() is not None:
+                    break
+                # No pipes are left to read but process is not yet terminated
+                # Only then it is safe to wait for the process to be finished
+                # NOTE: Actually cmd.poll() is always None here if rpipes is empty
+                elif not rpipes and cmd.poll() == None:
+                    cmd.wait()
+                    # The process is terminated. Since no pipes to read from are
+                    # left, there is no need to call select() again.
+                    break
+
+            cmd.stdout.close()
+            cmd.stderr.close()
+
+            rc = cmd.returncode
+        except (OSError, IOError), e:
+            self.fail_json(rc=e.errno, msg=str(e), cmd=clean_args)
+        except:
+            self.fail_json(rc=257, msg=traceback.format_exc(), cmd=clean_args)
+
+        if rc != 0 and check_rc:
+            msg = heuristic_log_sanitize(stderr.rstrip())
+            self.fail_json(cmd=clean_args, rc=rc, stdout=stdout, stderr=stderr, msg=msg)
+
+        # reset the pwd
+        os.chdir(prev_dir)
+
+        return (rc, stdout, stderr)
+
+    def append_to_file(self, filename, str):
+        filename = os.path.expandvars(os.path.expanduser(filename))
+        fh = open(filename, 'a')
+        fh.write(str)
+        fh.close()
+
+    def pretty_bytes(self,size):
+        ranges = (
+                (1<<70L, 'ZB'),
+                (1<<60L, 'EB'),
+                (1<<50L, 'PB'),
+                (1<<40L, 'TB'),
+                (1<<30L, 'GB'),
+                (1<<20L, 'MB'),
+                (1<<10L, 'KB'),
+                (1, 'Bytes')
+            )
+        for limit, suffix in ranges:
+            if size >= limit:
+                break
+        return '%.2f %s' % (float(size)/ limit, suffix)
+
+def get_module_path():
+    return os.path.dirname(os.path.realpath(__file__))
+# This code is part of Ansible, but is an independent component.
+# This particular file snippet, and this file snippet only, is BSD licensed.
+# Modules you write using this snippet, which is embedded dynamically by Ansible
+# still belong to the author of the module, and may assign their own license
+# to the complete work.
+#
+# Copyright (c), Michael DeHaan <michael.dehaan@gmail.com>, 2012-2013
+# Copyright (c), Toshio Kuratomi <tkuratomi@ansible.com>, 2015
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without modification,
+# are permitted provided that the following conditions are met:
+#
+#    * Redistributions of source code must retain the above copyright
+#      notice, this list of conditions and the following disclaimer.
+#    * Redistributions in binary form must reproduce the above copyright notice,
+#      this list of conditions and the following disclaimer in the documentation
+#      and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+# IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+# USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# The match_hostname function and supporting code is under the terms and
+# conditions of the Python Software Foundation License.  They were taken from
+# the Python3 standard library and adapted for use in Python2.  See comments in the
+# source for which code precisely is under this License.  PSF License text
+# follows:
+#
+# PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2
+# --------------------------------------------
+#
+# 1. This LICENSE AGREEMENT is between the Python Software Foundation
+# ("PSF"), and the Individual or Organization ("Licensee") accessing and
+# otherwise using this software ("Python") in source or binary form and
+# its associated documentation.
+#
+# 2. Subject to the terms and conditions of this License Agreement, PSF hereby
+# grants Licensee a nonexclusive, royalty-free, world-wide license to reproduce,
+# analyze, test, perform and/or display publicly, prepare derivative works,
+# distribute, and otherwise use Python alone or in any derivative version,
+# provided, however, that PSF's License Agreement and PSF's notice of copyright,
+# i.e., "Copyright (c) 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
+# 2011, 2012, 2013, 2014 Python Software Foundation; All Rights Reserved" are
+# retained in Python alone or in any derivative version prepared by Licensee.
+#
+# 3. In the event Licensee prepares a derivative work that is based on
+# or incorporates Python or any part thereof, and wants to make
+# the derivative work available to others as provided herein, then
+# Licensee hereby agrees to include in any such work a brief summary of
+# the changes made to Python.
+#
+# 4. PSF is making Python available to Licensee on an "AS IS"
+# basis.  PSF MAKES NO REPRESENTATIONS OR WARRANTIES, EXPRESS OR
+# IMPLIED.  BY WAY OF EXAMPLE, BUT NOT LIMITATION, PSF MAKES NO AND
+# DISCLAIMS ANY REPRESENTATION OR WARRANTY OF MERCHANTABILITY OR FITNESS
+# FOR ANY PARTICULAR PURPOSE OR THAT THE USE OF PYTHON WILL NOT
+# INFRINGE ANY THIRD PARTY RIGHTS.
+#
+# 5. PSF SHALL NOT BE LIABLE TO LICENSEE OR ANY OTHER USERS OF PYTHON
+# FOR ANY INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES OR LOSS AS
+# A RESULT OF MODIFYING, DISTRIBUTING, OR OTHERWISE USING PYTHON,
+# OR ANY DERIVATIVE THEREOF, EVEN IF ADVISED OF THE POSSIBILITY THEREOF.
+#
+# 6. This License Agreement will automatically terminate upon a material
+# breach of its terms and conditions.
+#
+# 7. Nothing in this License Agreement shall be deemed to create any
+# relationship of agency, partnership, or joint venture between PSF and
+# Licensee.  This License Agreement does not grant permission to use PSF
+# trademarks or trade name in a trademark sense to endorse or promote
+# products or services of Licensee, or any third party.
+#
+# 8. By copying, installing or otherwise using Python, Licensee
+# agrees to be bound by the terms and conditions of this License
+# Agreement.
+
+try:
+    import urllib2
+    HAS_URLLIB2 = True
+except:
+    HAS_URLLIB2 = False
+
+try:
+    import urlparse
+    HAS_URLPARSE = True
+except:
+    HAS_URLPARSE = False
+
+try:
+    import ssl
+    HAS_SSL=True
+except:
+    HAS_SSL=False
+
+HAS_MATCH_HOSTNAME = True
+try:
+    from ssl import match_hostname, CertificateError
+except ImportError:
+    try:
+        from backports.ssl_match_hostname import match_hostname, CertificateError
+    except ImportError:
+        HAS_MATCH_HOSTNAME = False
+
+if not HAS_MATCH_HOSTNAME:
+    ###
+    ### The following block of code is under the terms and conditions of the
+    ### Python Software Foundation License
+    ###
+
+    """The match_hostname() function from Python 3.4, essential when using SSL."""
+
+    import re
+
+    class CertificateError(ValueError):
+        pass
+
+
+    def _dnsname_match(dn, hostname, max_wildcards=1):
+        """Matching according to RFC 6125, section 6.4.3
+
+        http://tools.ietf.org/html/rfc6125#section-6.4.3
+        """
+        pats = []
+        if not dn:
+            return False
+
+        # Ported from python3-syntax:
+        # leftmost, *remainder = dn.split(r'.')
+        parts = dn.split(r'.')
+        leftmost = parts[0]
+        remainder = parts[1:]
+
+        wildcards = leftmost.count('*')
+        if wildcards > max_wildcards:
+            # Issue #17980: avoid denials of service by refusing more
+            # than one wildcard per fragment.  A survey of established
+            # policy among SSL implementations showed it to be a
+            # reasonable choice.
+            raise CertificateError(
+                "too many wildcards in certificate DNS name: " + repr(dn))
+
+        # speed up common case w/o wildcards
+        if not wildcards:
+            return dn.lower() == hostname.lower()
+
+        # RFC 6125, section 6.4.3, subitem 1.
+        # The client SHOULD NOT attempt to match a presented identifier in which
+        # the wildcard character comprises a label other than the left-most label.
+        if leftmost == '*':
+            # When '*' is a fragment by itself, it matches a non-empty dotless
+            # fragment.
+            pats.append('[^.]+')
+        elif leftmost.startswith('xn--') or hostname.startswith('xn--'):
+            # RFC 6125, section 6.4.3, subitem 3.
+            # The client SHOULD NOT attempt to match a presented identifier
+            # where the wildcard character is embedded within an A-label or
+            # U-label of an internationalized domain name.
+            pats.append(re.escape(leftmost))
+        else:
+            # Otherwise, '*' matches any dotless string, e.g. www*
+            pats.append(re.escape(leftmost).replace(r'\*', '[^.]*'))
+
+        # add the remaining fragments, ignore any wildcards
+        for frag in remainder:
+            pats.append(re.escape(frag))
+
+        pat = re.compile(r'\A' + r'\.'.join(pats) + r'\Z', re.IGNORECASE)
+        return pat.match(hostname)
+
+
+    def match_hostname(cert, hostname):
+        """Verify that *cert* (in decoded format as returned by
+        SSLSocket.getpeercert()) matches the *hostname*.  RFC 2818 and RFC 6125
+        rules are followed, but IP addresses are not accepted for *hostname*.
+
+        CertificateError is raised on failure. On success, the function
+        returns nothing.
+        """
+        if not cert:
+            raise ValueError("empty or no certificate")
+        dnsnames = []
+        san = cert.get('subjectAltName', ())
+        for key, value in san:
+            if key == 'DNS':
+                if _dnsname_match(value, hostname):
+                    return
+                dnsnames.append(value)
+        if not dnsnames:
+            # The subject is only checked when there is no dNSName entry
+            # in subjectAltName
+            for sub in cert.get('subject', ()):
+                for key, value in sub:
+                    # XXX according to RFC 2818, the most specific Common Name
+                    # must be used.
+                    if key == 'commonName':
+                        if _dnsname_match(value, hostname):
+                            return
+                        dnsnames.append(value)
+        if len(dnsnames) > 1:
+            raise CertificateError("hostname %r "
+                "doesn't match either of %s"
+                % (hostname, ', '.join(map(repr, dnsnames))))
+        elif len(dnsnames) == 1:
+            raise CertificateError("hostname %r "
+                "doesn't match %r"
+                % (hostname, dnsnames[0]))
+        else:
+            raise CertificateError("no appropriate commonName or "
+                "subjectAltName fields were found")
+
+    ###
+    ### End of Python Software Foundation Licensed code
+    ###
+
+    HAS_MATCH_HOSTNAME = True
+
+
+import httplib
+import os
+import re
+import sys
+import socket
+import platform
+import tempfile
+
+
+# This is a dummy cacert provided for Mac OS since you need at least 1
+# ca cert, regardless of validity, for Python on Mac OS to use the
+# keychain functionality in OpenSSL for validating SSL certificates.
+# See: http://mercurial.selenic.com/wiki/CACertificates#Mac_OS_X_10.6_and_higher
+DUMMY_CA_CERT = """-----BEGIN CERTIFICATE-----
+MIICvDCCAiWgAwIBAgIJAO8E12S7/qEpMA0GCSqGSIb3DQEBBQUAMEkxCzAJBgNV
+BAYTAlVTMRcwFQYDVQQIEw5Ob3J0aCBDYXJvbGluYTEPMA0GA1UEBxMGRHVyaGFt
+MRAwDgYDVQQKEwdBbnNpYmxlMB4XDTE0MDMxODIyMDAyMloXDTI0MDMxNTIyMDAy
+MlowSTELMAkGA1UEBhMCVVMxFzAVBgNVBAgTDk5vcnRoIENhcm9saW5hMQ8wDQYD
+VQQHEwZEdXJoYW0xEDAOBgNVBAoTB0Fuc2libGUwgZ8wDQYJKoZIhvcNAQEBBQAD
+gY0AMIGJAoGBANtvpPq3IlNlRbCHhZAcP6WCzhc5RbsDqyh1zrkmLi0GwcQ3z/r9
+gaWfQBYhHpobK2Tiq11TfraHeNB3/VfNImjZcGpN8Fl3MWwu7LfVkJy3gNNnxkA1
+4Go0/LmIvRFHhbzgfuo9NFgjPmmab9eqXJceqZIlz2C8xA7EeG7ku0+vAgMBAAGj
+gaswgagwHQYDVR0OBBYEFPnN1nPRqNDXGlCqCvdZchRNi/FaMHkGA1UdIwRyMHCA
+FPnN1nPRqNDXGlCqCvdZchRNi/FaoU2kSzBJMQswCQYDVQQGEwJVUzEXMBUGA1UE
+CBMOTm9ydGggQ2Fyb2xpbmExDzANBgNVBAcTBkR1cmhhbTEQMA4GA1UEChMHQW5z
+aWJsZYIJAO8E12S7/qEpMAwGA1UdEwQFMAMBAf8wDQYJKoZIhvcNAQEFBQADgYEA
+MUB80IR6knq9K/tY+hvPsZer6eFMzO3JGkRFBh2kn6JdMDnhYGX7AXVHGflrwNQH
+qFy+aenWXsC0ZvrikFxbQnX8GVtDADtVznxOi7XzFw7JOxdsVrpXgSN0eh0aMzvV
+zKPZsZ2miVGclicJHzm5q080b1p/sZtuKIEZk6vZqEg=
+-----END CERTIFICATE-----
+"""
+
+#
+# Exceptions
+#
+
+class ConnectionError(Exception):
+    """Failed to connect to the server"""
+    pass
+
+class ProxyError(ConnectionError):
+    """Failure to connect because of a proxy"""
+    pass
+
+class SSLValidationError(ConnectionError):
+    """Failure to connect due to SSL validation failing"""
+    pass
+
+class NoSSLError(SSLValidationError):
+    """Needed to connect to an HTTPS url but no ssl library available to verify the certificate"""
+    pass
+
+
+class CustomHTTPSConnection(httplib.HTTPSConnection):
+    def connect(self):
+        "Connect to a host on a given (SSL) port."
+
+        if hasattr(self, 'source_address'):
+            sock = socket.create_connection((self.host, self.port), self.timeout, self.source_address)
+        else:
+            sock = socket.create_connection((self.host, self.port), self.timeout)
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        self.sock = ssl.wrap_socket(sock, keyfile=self.key_file, certfile=self.cert_file, ssl_version=ssl.PROTOCOL_TLSv1)
+
+class CustomHTTPSHandler(urllib2.HTTPSHandler):
+
+    def https_open(self, req):
+        return self.do_open(CustomHTTPSConnection, req)
+
+    https_request = urllib2.AbstractHTTPHandler.do_request_
+
+def generic_urlparse(parts):
+    '''
+    Returns a dictionary of url parts as parsed by urlparse,
+    but accounts for the fact that older versions of that
+    library do not support named attributes (ie. .netloc)
+    '''
+    generic_parts = dict()
+    if hasattr(parts, 'netloc'):
+        # urlparse is newer, just read the fields straight
+        # from the parts object
+        generic_parts['scheme']   = parts.scheme
+        generic_parts['netloc']   = parts.netloc
+        generic_parts['path']     = parts.path
+        generic_parts['params']   = parts.params
+        generic_parts['query']    = parts.query
+        generic_parts['fragment'] = parts.fragment
+        generic_parts['username'] = parts.username
+        generic_parts['password'] = parts.password
+        generic_parts['hostname'] = parts.hostname
+        generic_parts['port']     = parts.port
+    else:
+        # we have to use indexes, and then parse out
+        # the other parts not supported by indexing
+        generic_parts['scheme']   = parts[0]
+        generic_parts['netloc']   = parts[1]
+        generic_parts['path']     = parts[2]
+        generic_parts['params']   = parts[3]
+        generic_parts['query']    = parts[4]
+        generic_parts['fragment'] = parts[5]
+        # get the username, password, etc.
+        try:
+            netloc_re = re.compile(r'^((?:\w)+(?::(?:\w)+)?@)?([A-Za-z0-9.-]+)(:\d+)?$')
+            (auth, hostname, port) = netloc_re.match(parts[1])
+            if port:
+                # the capture group for the port will include the ':',
+                # so remove it and convert the port to an integer
+                port = int(port[1:])
+            if auth:
+                # the capture group above inclues the @, so remove it
+                # and then split it up based on the first ':' found
+                auth = auth[:-1]
+                username, password = auth.split(':', 1)
+            generic_parts['username'] = username
+            generic_parts['password'] = password
+            generic_parts['hostname'] = hostname
+            generic_parts['port']     = port
+        except:
+            generic_parts['username'] = None
+            generic_parts['password'] = None
+            generic_parts['hostname'] = None
+            generic_parts['port']     = None
+    return generic_parts
+
+class RequestWithMethod(urllib2.Request):
+    '''
+    Workaround for using DELETE/PUT/etc with urllib2
+    Originally contained in library/net_infrastructure/dnsmadeeasy
+    '''
+
+    def __init__(self, url, method, data=None, headers={}):
+        self._method = method
+        urllib2.Request.__init__(self, url, data, headers)
+
+    def get_method(self):
+        if self._method:
+            return self._method
+        else:
+            return urllib2.Request.get_method(self)
+
+
+class SSLValidationHandler(urllib2.BaseHandler):
+    '''
+    A custom handler class for SSL validation.
+
+    Based on:
+    http://stackoverflow.com/questions/1087227/validate-ssl-certificates-with-python
+    http://techknack.net/python-urllib2-handlers/
+    '''
+    CONNECT_COMMAND = "CONNECT %s:%s HTTP/1.0\r\nConnection: close\r\n"
+
+    def __init__(self, hostname, port):
+        self.hostname = hostname
+        self.port = port
+
+    def get_ca_certs(self):
+        # tries to find a valid CA cert in one of the
+        # standard locations for the current distribution
+
+        ca_certs = []
+        paths_checked = []
+
+        system = platform.system()
+        # build a list of paths to check for .crt/.pem files
+        # based on the platform type
+        paths_checked.append('/etc/ssl/certs')
+        if system == 'Linux':
+            paths_checked.append('/etc/pki/ca-trust/extracted/pem')
+            paths_checked.append('/etc/pki/tls/certs')
+            paths_checked.append('/usr/share/ca-certificates/cacert.org')
+        elif system == 'FreeBSD':
+            paths_checked.append('/usr/local/share/certs')
+        elif system == 'OpenBSD':
+            paths_checked.append('/etc/ssl')
+        elif system == 'NetBSD':
+            ca_certs.append('/etc/openssl/certs')
+        elif system == 'SunOS':
+            paths_checked.append('/opt/local/etc/openssl/certs')
+
+        # fall back to a user-deployed cert in a standard
+        # location if the OS platform one is not available
+        paths_checked.append('/etc/ansible')
+
+        tmp_fd, tmp_path = tempfile.mkstemp()
+
+        # Write the dummy ca cert if we are running on Mac OS X
+        if system == 'Darwin':
+            os.write(tmp_fd, DUMMY_CA_CERT)
+            # Default Homebrew path for OpenSSL certs 
+            paths_checked.append('/usr/local/etc/openssl')
+
+        # for all of the paths, find any  .crt or .pem files
+        # and compile them into single temp file for use
+        # in the ssl check to speed up the test
+        for path in paths_checked:
+            if os.path.exists(path) and os.path.isdir(path):
+                dir_contents = os.listdir(path)
+                for f in dir_contents:
+                    full_path = os.path.join(path, f)
+                    if os.path.isfile(full_path) and os.path.splitext(f)[1] in ('.crt','.pem'):
+                        try:
+                            cert_file = open(full_path, 'r')
+                            os.write(tmp_fd, cert_file.read())
+                            os.write(tmp_fd, '\n')
+                            cert_file.close()
+                        except:
+                            pass
+
+        return (tmp_path, paths_checked)
+
+    def validate_proxy_response(self, response, valid_codes=[200]):
+        '''
+        make sure we get back a valid code from the proxy
+        '''
+        try:
+            (http_version, resp_code, msg) = re.match(r'(HTTP/\d\.\d) (\d\d\d) (.*)', response).groups()
+            if int(resp_code) not in valid_codes:
+                raise Exception
+        except:
+            raise ProxyError('Connection to proxy failed')
+
+    def detect_no_proxy(self, url):
+        '''
+        Detect if the 'no_proxy' environment variable is set and honor those locations.
+        '''
+        env_no_proxy = os.environ.get('no_proxy')
+        if env_no_proxy:
+            env_no_proxy = env_no_proxy.split(',')
+            netloc = urlparse.urlparse(url).netloc
+
+            for host in env_no_proxy:
+                if netloc.endswith(host) or netloc.split(':')[0].endswith(host):
+                    # Our requested URL matches something in no_proxy, so don't
+                    # use the proxy for this
+                    return False
+        return True
+
+    def http_request(self, req):
+        tmp_ca_cert_path, paths_checked = self.get_ca_certs()
+        https_proxy = os.environ.get('https_proxy')
+
+        # Detect if 'no_proxy' environment variable is set and if our URL is included
+        use_proxy = self.detect_no_proxy(req.get_full_url())
+
+        if not use_proxy:
+            # ignore proxy settings for this host request
+            return req
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if https_proxy:
+                proxy_parts = generic_urlparse(urlparse.urlparse(https_proxy))
+                s.connect((proxy_parts.get('hostname'), proxy_parts.get('port')))
+                if proxy_parts.get('scheme') == 'http':
+                    s.sendall(self.CONNECT_COMMAND % (self.hostname, self.port))
+                    if proxy_parts.get('username'):
+                        credentials = "%s:%s" % (proxy_parts.get('username',''), proxy_parts.get('password',''))
+                        s.sendall('Proxy-Authorization: Basic %s\r\n' % credentials.encode('base64').strip())
+                    s.sendall('\r\n')
+                    connect_result = s.recv(4096)
+                    self.validate_proxy_response(connect_result)
+                    ssl_s = ssl.wrap_socket(s, ca_certs=tmp_ca_cert_path, cert_reqs=ssl.CERT_REQUIRED)
+                    match_hostname(ssl_s.getpeercert(), self.hostname)
+                else:
+                    raise ProxyError('Unsupported proxy scheme: %s. Currently ansible only supports HTTP proxies.' % proxy_parts.get('scheme'))
+            else:
+                s.connect((self.hostname, self.port))
+                ssl_s = ssl.wrap_socket(s, ca_certs=tmp_ca_cert_path, cert_reqs=ssl.CERT_REQUIRED)
+                match_hostname(ssl_s.getpeercert(), self.hostname)
+            # close the ssl connection
+            #ssl_s.unwrap()
+            s.close()
+        except (ssl.SSLError, socket.error), e:
+            # fail if we tried all of the certs but none worked
+            if 'connection refused' in str(e).lower():
+                raise ConnectionError('Failed to connect to %s:%s.' % (self.hostname, self.port))
+            else:
+                raise SSLValidationError('Failed to validate the SSL certificate for %s:%s. '
+                    'Use validate_certs=False (insecure) or make sure your managed systems have a valid CA certificate installed. '
+                    'Paths checked for this platform: %s' % (self.hostname, self.port, ", ".join(paths_checked))
+                )
+        except CertificateError:
+            raise SSLValidationError("SSL Certificate does not belong to %s.  Make sure the url has a certificate that belongs to it or use validate_certs=False (insecure)" % self.hostname)
+
+        try:
+            # cleanup the temp file created, don't worry
+            # if it fails for some reason
+            os.remove(tmp_ca_cert_path)
+        except:
+            pass
+
+        return req
+
+    https_request = http_request
+
+# Rewrite of fetch_url to not require the module environment
+def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+        force=False, last_mod_time=None, timeout=10, validate_certs=True,
+        url_username=None, url_password=None, http_agent=None):
+    '''
+    Fetches a file from an HTTP/FTP server using urllib2
+    '''
+    handlers = []
+
+    # FIXME: change the following to use the generic_urlparse function
+    #        to remove the indexed references for 'parsed'
+    parsed = urlparse.urlparse(url)
+    if parsed[0] == 'https' and validate_certs:
+        if not HAS_SSL:
+            raise NoSSLError('SSL validation is not available in your version of python. You can use validate_certs=False, however this is unsafe and not recommended')
+        if not HAS_MATCH_HOSTNAME:
+            raise SSLValidationError('Available SSL validation does not check that the certificate matches the hostname.  You can install backports.ssl_match_hostname or update your managed machine to python-2.7.9 or newer.  You could also use validate_certs=False, however this is unsafe and not recommended')
+
+        # do the cert validation
+        netloc = parsed[1]
+        if '@' in netloc:
+            netloc = netloc.split('@', 1)[1]
+        if ':' in netloc:
+            hostname, port = netloc.split(':', 1)
+            port = int(port)
+        else:
+            hostname = netloc
+            port = 443
+        # create the SSL validation handler and
+        # add it to the list of handlers
+        ssl_handler = SSLValidationHandler(hostname, port)
+        handlers.append(ssl_handler)
+
+    if parsed[0] != 'ftp':
+        username = url_username
+
+        if username:
+            password = url_password
+            netloc = parsed[1]
+        elif '@' in parsed[1]:
+            credentials, netloc = parsed[1].split('@', 1)
+            if ':' in credentials:
+                username, password = credentials.split(':', 1)
+            else:
+                username = credentials
+                password = ''
+
+            parsed = list(parsed)
+            parsed[1] = netloc
+
+            # reconstruct url without credentials
+            url = urlparse.urlunparse(parsed)
+
+        if username:
+            passman = urllib2.HTTPPasswordMgrWithDefaultRealm()
+
+            # this creates a password manager
+            passman.add_password(None, netloc, username, password)
+
+            # because we have put None at the start it will always
+            # use this username/password combination for  urls
+            # for which `theurl` is a super-url
+            authhandler = urllib2.HTTPBasicAuthHandler(passman)
+
+            # create the AuthHandler
+            handlers.append(authhandler)
+
+    if not use_proxy:
+        proxyhandler = urllib2.ProxyHandler({})
+        handlers.append(proxyhandler)
+
+    # pre-2.6 versions of python cannot use the custom https
+    # handler, since the socket class is lacking this method
+    if hasattr(socket, 'create_connection'):
+        handlers.append(CustomHTTPSHandler)
+
+    opener = urllib2.build_opener(*handlers)
+    urllib2.install_opener(opener)
+
+    if method:
+        if method.upper() not in ('OPTIONS','GET','HEAD','POST','PUT','DELETE','TRACE','CONNECT'):
+            raise ConnectionError('invalid HTTP request method; %s' % method.upper())
+        request = RequestWithMethod(url, method.upper(), data)
+    else:
+        request = urllib2.Request(url, data)
+
+    # add the custom agent header, to help prevent issues 
+    # with sites that block the default urllib agent string 
+    request.add_header('User-agent', http_agent)
+
+    # if we're ok with getting a 304, set the timestamp in the 
+    # header, otherwise make sure we don't get a cached copy
+    if last_mod_time and not force:
+        tstamp = last_mod_time.strftime('%a, %d %b %Y %H:%M:%S +0000')
+        request.add_header('If-Modified-Since', tstamp)
+    else:
+        request.add_header('cache-control', 'no-cache')
+
+    # user defined headers now, which may override things we've set above
+    if headers:
+        if not isinstance(headers, dict):
+            raise ValueError("headers provided to fetch_url() must be a dict")
+        for header in headers:
+            request.add_header(header, headers[header])
+
+    if sys.version_info < (2,6,0):
+        # urlopen in python prior to 2.6.0 did not
+        # have a timeout parameter
+        r = urllib2.urlopen(request, None)
+    else:
+        r = urllib2.urlopen(request, None, timeout)
+
+    return r
+
+#
+# Module-related functions
+#
+
+def url_argument_spec():
+    '''
+    Creates an argument spec that can be used with any module
+    that will be requesting content via urllib/urllib2
+    '''
+    return dict(
+        url = dict(),
+        force = dict(default='no', aliases=['thirsty'], type='bool'),
+        http_agent = dict(default='ansible-httpget'),
+        use_proxy = dict(default='yes', type='bool'),
+        validate_certs = dict(default='yes', type='bool'),
+        url_username = dict(required=False),
+        url_password = dict(required=False),
+    )
+
+def fetch_url(module, url, data=None, headers=None, method=None, 
+              use_proxy=True, force=False, last_mod_time=None, timeout=10):
+    '''
+    Fetches a file from an HTTP/FTP server using urllib2.  Requires the module environment
+    '''
+
+    if not HAS_URLLIB2:
+        module.fail_json(msg='urllib2 is not installed')
+    elif not HAS_URLPARSE:
+        module.fail_json(msg='urlparse is not installed')
+
+    # Get validate_certs from the module params
+    validate_certs = module.params.get('validate_certs', True)
+
+    username = module.params.get('url_username', '')
+    password = module.params.get('url_password', '')
+    http_agent = module.params.get('http_agent', None)
+
+    r = None
+    info = dict(url=url)
+    try:
+        r = open_url(url, data=data, headers=headers, method=method,
+                use_proxy=use_proxy, force=force, last_mod_time=last_mod_time, timeout=timeout,
+                validate_certs=validate_certs, url_username=username,
+                url_password=password, http_agent=http_agent)
+        info.update(r.info())
+        info['url'] = r.geturl()  # The URL goes in too, because of redirects.
+        info.update(dict(msg="OK (%s bytes)" % r.headers.get('Content-Length', 'unknown'), status=200))
+    except NoSSLError, e:
+        distribution = get_distribution()
+        if distribution.lower() == 'redhat':
+            module.fail_json(msg='%s. You can also install python-ssl from EPEL' % str(e))
+    except (ConnectionError, ValueError), e:
+        module.fail_json(msg=str(e))
+    except urllib2.HTTPError, e:
+        info.update(dict(msg=str(e), status=e.code))
+    except urllib2.URLError, e:
+        code = int(getattr(e, 'code', -1))
+        info.update(dict(msg="Request failed: %s" % str(e), status=code))
+    except socket.error, e:
+        info.update(dict(msg="Connection failure: %s" % str(e), status=-1))
+    except Exception, e:
+        info.update(dict(msg="An unknown error occurred: %s" % str(e), status=-1))
+
+    return r, info
+if __name__ == '__main__':
+    main()
+
+
