@@ -484,3 +484,89 @@
   484  cat history history.txt
   485  cat history > history.txt
   486  history > history.txt
+  487  git add history.txt
+  488  git commit
+  489  git status
+  490  git push origin master
+  491  pvdisplay
+  492  source keystonerc_admin
+  493  glance image-list
+  494  glance help image-create
+  495  glance image-create --name cirros_alpha --disk-format qcow2 --container-format bare --is-public true --location https://download.cirros-cloud.net/0.3.4/cirros-0.3.4-x86_64-disk.img
+  496  glance image-list
+  497  neutron net-list
+  498  nova boot --flavor custom.shrimpy --image cirros_alpha --nic net-id=444be138-d67b-4e2e-8b09-962f4d9fa598 admin_box
+  499  nova boot --flavor custom.shrimpy --image cirros_alpha --nic net-id=20ca30a2-e3fb-4e62-bd78-08dc471e93ed admin_box
+  500  pvdisplay
+  501  source keystonerc_chestercopperpot
+  502  cinder create --display_name NASferatu 1
+  503  cinder list
+  504  nova list
+  505  nova volume-attach /dev/vdb 7ea45f74-fee7-4304-b825-f8b779d03cd7 auto
+  506  nova volume-attach vt2 7ea45f74-fee7-4304-b825-f8b779d03cd7 auto
+  507  cinder list
+  508  nova list
+  509  nova volume-attach 884e3667-ad0f-4282-a76a-62891070a07e 7ea45f74-fee7-4304-b825-f8b779d03cd7 auto
+  510  nova volume-attach 7ea45f74-fee7-4304-b825-f8b779d03cd7 884e3667-ad0f-4282-a76a-62891070a07e auto
+  511  cinder list
+  512  nova volume-detach 7ea45f74-fee7-4304-b825-f8b779d03cd7 884e3667-ad0f-4282-a76a-62891070a07e auto
+  513  nova volume-detach 7ea45f74-fee7-4304-b825-f8b779d03cd7 884e3667-ad0f-4282-a76a-62891070a07e
+  514  cinder list
+  515  cinder delete NASferatu
+  516  cinder list
+  517  nova show vt2 | grep network
+  518  neutron router-list | cut -c -59
+  519  ssh root@neutron
+  520  neutron router-list | cut -c -59
+  521  ssh root@neutron
+  522  neutron net-list | grep vault
+  523  neutron net-list 
+  524  nova boot --flavor m1.tiny --image cirros --nic net-id=991a1d6c-e7de-4595-bf74-993e9c31ea18 --security-groups http-ssh vt3
+  525  nova list
+  526  cinder list
+  527  nova volume-detach 7ea45f74-fee7-4304-b825-f8b779d03cd7 eb173988-e9ab-4696-8ebe-f24d759f126d
+  528  cinder list
+  529  nova volume-attach 4169954f-0c4d-4f93-9bb7-55289a5eb76a eb173988-e9ab-4696-8ebe-f24d759f126d auto
+  530  ip netns list
+  531  nova show vt3 | grep network
+  532  neutron router-list | cut -c -59
+  533  ssh root@neutron
+  534  su centos
+  535  ls
+  536  cp key* myopenstack/
+  537  cp answers.txt myopenstack/
+  538  ls -ltr
+  539  ls -ltr /users/
+  540  ls -ltr /usr/
+  541  pwd
+  542  /home
+  543  ls -ltr /home
+  544  cp /home/stack myopenstack/
+  545  cp -r /home/stack myopenstack/
+  546  cp -r /home/centos myopenstack/
+  547  ls -ltr myopenstack/
+  548  cd myopenstack/
+  549  ls
+  550  ls -la
+  551  cp ../.bash* .
+  552  ls -ltr
+  553  view history.txt 
+  554  git config --global user.email "matthew.heyer@gmail.com"   
+  555  git config --list 
+  556  git init
+  557  git status
+  558  git push origin master
+  559  git pull origin master
+  560  git remote add origin https://github.com/HeyerPlane/myopenstack.git
+  561  git remote add origin https://github.com/HeyerLand/myopenstack.git  
+  562  it status
+  563  git status
+  564  git add *
+  565  git status
+  566  git add *.bash*
+  567  git status
+  568  git commit -m 'This is moving my files from the labs"
+  569  git commit -m 'This is moving my files from the labs'
+  570  git push origin master  
+  571  git pull origin master
+  572  history > history.txt
